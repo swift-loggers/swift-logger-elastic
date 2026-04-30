@@ -1,34 +1,42 @@
 import Foundation
 import Loggers
 
-/// A `Logger` adapter targeting a first-party Elasticsearch intake /
-/// proxy endpoint.
+/// A `Logger` adapter that materializes, redacts, and ECS-encodes
+/// each allowed entry for delivery to a first-party Elasticsearch
+/// intake / proxy endpoint.
 ///
-/// ## Status: M3.0 scaffolding
+/// ## Status: M3.1 (this release)
 ///
-/// This release ships only the locked public surface. The drop guard
-/// is wired up: entries below the configured threshold and entries at
-/// `LoggerLevel.disabled` are dropped without evaluating the message
-/// or attributes autoclosures. **Allowed entries are accepted and
-/// discarded.** Nothing is encoded, no network request is issued, and
-/// no record reaches an intake URL yet.
+/// For each allowed entry the adapter:
 ///
-/// The public initializer surface and the ``MinimumLevel`` threshold
-/// are locked here so the encoder (M3.1) and the ordered delivery
-/// pipeline (M3.2) can be filled in without breaking call sites.
+/// 1. evaluates the `message` and `attributes` autoclosures exactly
+///    once,
+/// 2. builds a `LogRecord` stamped with a wall-clock timestamp,
+/// 3. runs the record through an internal redactor that replaces
+///    private segments and attribute values with `<private>` and
+///    sensitive ones with `<redacted>`, and
+/// 4. encodes the redacted record as Elastic Common Schema (ECS)
+///    JSON.
 ///
-/// ## Planned behavior (M3.1, M3.2)
+/// The encoded `Data` is intentionally discarded today; the M3.2
+/// delivery pipeline will pick it up. **M3.1 still performs no
+/// network I/O.** Entries strictly below the configured
+/// ``MinimumLevel`` and entries at `LoggerLevel.disabled` are
+/// dropped without evaluating the message or attributes
+/// autoclosures.
 ///
-/// Once the follow-up milestones land, this adapter will:
+/// The encoder and redactor are intentionally internal in this
+/// release; the swappable contract for them lands together with the
+/// shared remote-adapter API once M3.2 and a second remote sink
+/// inform the protocol shape.
 ///
-/// - materialize and redact each allowed entry,
-/// - encode it as Elastic Common Schema (ECS) JSON, and
-/// - POST it to ``intakeURL`` through an ordered delivery pipeline
-///   with batching, retry, flush-on-lifecycle, and bounded
-///   backpressure.
+/// ## Planned behavior (M3.2)
 ///
-/// The universal `Logger` contract stays synchronous; ordering is
-/// the adapter's responsibility, not the call site's.
+/// Once the M3.2 delivery pipeline lands, this adapter will POST
+/// the encoded ECS JSON to ``intakeURL`` through an ordered queue
+/// with batching, retry, flush-on-lifecycle, and bounded
+/// backpressure. The universal `Logger` contract stays synchronous;
+/// ordering is the adapter's responsibility, not the call site's.
 ///
 /// ## Threat model
 ///
@@ -81,24 +89,44 @@ public struct ElasticLogger: Loggers.Logger {
 
     /// The first-party intake / proxy endpoint configured for this
     /// logger. Once the M3.2 delivery pipeline lands, encoded records
-    /// will be POSTed here; in the M3.0 scaffold the URL is stored
-    /// but no request is issued.
+    /// will be POSTed here; in M3.1 the URL is stored but no request
+    /// is issued.
     public let intakeURL: URL
 
-    /// The value the M3.1 encoder will stamp as the `service.name`
-    /// field on every emitted record. Typically the app or library
-    /// name, for example `"demo-ios"`. Stored verbatim by the M3.0
-    /// scaffold; not yet read by any encoder.
+    /// The value the encoder stamps as the ECS `service.name` field
+    /// on every encoded record. Typically the app or library name,
+    /// for example `"demo-ios"`.
     public let serviceName: String
 
     /// The drop-guard threshold for this logger. Entries whose
     /// severity is strictly lower than this value -- and entries at
     /// `LoggerLevel.disabled` -- are dropped without evaluating the
     /// message or attributes autoclosures. Entries at or above this
-    /// value pass the drop guard; in M3.0 they are accepted and
-    /// discarded, and once M3.1 / M3.2 land they will be redacted,
-    /// encoded, and POSTed to ``intakeURL``.
+    /// value are materialized, redacted, and ECS-encoded; the
+    /// encoded payload is discarded today and will be POSTed to
+    /// ``intakeURL`` once the M3.2 delivery pipeline lands.
     public let minimumLevel: MinimumLevel
+
+    /// Wall-clock source used to stamp `LogRecord.timestamp` when an
+    /// allowed entry is materialized. Defaults to `Date.init`; the
+    /// tests inject a fixed clock so golden ECS JSON output is
+    /// byte-stable.
+    private let dateProvider: @Sendable () -> Date
+
+    /// Internal redactor applied to every materialized record before
+    /// it reaches the encoder. Stateless and not configurable in M3.1.
+    private let redactor: DefaultRedactor
+
+    /// Internal ECS encoder. Stateless and not configurable in M3.1.
+    private let encoder: ECSEncoder
+
+    /// Internal sink that receives every successfully encoded payload.
+    /// Defaults to a no-op so production callers see no behavior
+    /// change; tests inject a recorder to assert that allowed entries
+    /// reach the encoder and produce a valid ECS document. Once the
+    /// M3.2 delivery pipeline lands, this seam is replaced by the
+    /// ordered enqueue path and removed from the public surface.
+    private let onEncoded: @Sendable (Data) -> Void
 
     /// Creates an `ElasticLogger`.
     ///
@@ -106,9 +134,8 @@ public struct ElasticLogger: Loggers.Logger {
     ///   - intakeURL: The first-party intake / proxy endpoint. Must
     ///     not be a direct Elasticsearch endpoint that requires an
     ///     API key embedded in the client.
-    ///   - serviceName: The value the M3.1 encoder will stamp as
-    ///     the `service.name` field on every emitted record.
-    ///     Stored verbatim by the M3.0 scaffold and not yet read.
+    ///   - serviceName: The value emitted as the ECS `service.name`
+    ///     field on every encoded record.
     ///   - minimumLevel: The minimum severity to emit. Defaults to
     ///     ``MinimumLevel/defaultLevel``.
     public init(
@@ -116,21 +143,56 @@ public struct ElasticLogger: Loggers.Logger {
         serviceName: String,
         minimumLevel: MinimumLevel = .defaultLevel
     ) {
+        self.init(
+            intakeURL: intakeURL,
+            serviceName: serviceName,
+            minimumLevel: minimumLevel,
+            dateProvider: { Date() },
+            onEncoded: { _ in }
+        )
+    }
+
+    /// Creates an `ElasticLogger` with an injected wall-clock source
+    /// and an injected encoded-payload sink. Internal so production
+    /// callers cannot depend on either seam while tests can pin a
+    /// deterministic timestamp and observe what the encoder produces.
+    init(
+        intakeURL: URL,
+        serviceName: String,
+        minimumLevel: MinimumLevel = .defaultLevel,
+        dateProvider: @escaping @Sendable () -> Date,
+        onEncoded: @escaping @Sendable (Data) -> Void = { _ in }
+    ) {
         self.intakeURL = intakeURL
         self.serviceName = serviceName
         self.minimumLevel = minimumLevel
+        self.dateProvider = dateProvider
+        self.onEncoded = onEncoded
+        redactor = DefaultRedactor()
+        encoder = ECSEncoder()
     }
 
     public func log(
         _ level: LoggerLevel,
-        _: LoggerDomain,
-        _: @autoclosure @escaping @Sendable () -> LogMessage,
-        attributes _: @autoclosure @escaping @Sendable () -> [LogAttribute]
+        _ domain: LoggerDomain,
+        _ message: @autoclosure @escaping @Sendable () -> LogMessage,
+        attributes: @autoclosure @escaping @Sendable () -> [LogAttribute]
     ) {
         guard shouldEmit(level) else { return }
-        // M3.0 placeholder: the drop guard is wired up so call sites
-        // can already integrate. Materialization, redaction, encoding,
-        // and ordered enqueue land in M3.1 and M3.2.
+        let record = LogRecord(
+            timestamp: dateProvider(),
+            level: level,
+            domain: domain,
+            message: message(),
+            attributes: attributes()
+        )
+        let redacted = redactor.redact(record)
+        let encoded = encoder.encode(redacted, serviceName: serviceName)
+        // M3.1: hand the encoded payload to the internal sink. In
+        // production the sink is a no-op (network I/O lands in M3.2);
+        // in tests it is a recorder that pins the integration path
+        // end-to-end.
+        onEncoded(encoded)
     }
 
     /// Returns whether an entry at the given severity passes the

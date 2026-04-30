@@ -4,31 +4,28 @@ Elasticsearch adapter for [`swift-loggers`](https://github.com/swift-loggers),
 built on top of
 [`swift-loggers/swift-logger`](https://github.com/swift-loggers/swift-logger).
 
-Once the M3.1 encoder and M3.2 delivery pipeline ship, the adapter
-will forward entries from the universal `Logger` contract to a
-first-party intake / proxy endpoint as ECS-compatible JSON, queryable
-in Elasticsearch and Kibana, with lazy evaluation, privacy-safe
-rendering, and the seven-severity model preserved end-to-end. Until
-then, the M3.0 release ships only the locked public surface and the
-drop guard described below; allowed entries are accepted and
-discarded with no encoding and no network I/O.
+For each allowed entry the adapter materializes the record,
+redacts private and sensitive content, and encodes it as Elastic
+Common Schema (ECS) JSON. Privacy-safe rendering is applied
+during materialization, and the seven-severity model and lazy
+evaluation of message and attributes are preserved. Once M3.2
+lands the delivery pipeline, the encoded payload will be POSTed
+to a first-party intake / proxy endpoint, where it can be queried
+in Elasticsearch and visualized in Kibana.
 
-> **Status: M3.0 scaffolding (this release).**
-> The public initializer surface and `MinimumLevel` are locked, and
-> entries below the configured threshold (and `.disabled`) are
-> dropped without evaluating the message or attributes autoclosures.
-> Allowed entries are accepted and discarded; nothing is encoded or
-> sent on the network yet. Call sites can integrate against the
-> stable API today; the encoder and delivery pipeline that fulfill
-> the value proposition above land in M3.1 and M3.2.
+> **Status: M3.1 (this release).**
+> The public initializer surface and `MinimumLevel` are locked.
+> Entries below the configured threshold (and `LoggerLevel.disabled`)
+> are dropped without evaluating the message or attributes
+> autoclosures. Allowed entries are materialized once, redacted, and
+> ECS-encoded; the encoded `Data` is intentionally discarded today
+> because the network transport lands in M3.2. M3.1 still performs
+> no network I/O.
 
 Planned milestones:
 
-- **M3.1** -- Elastic Common Schema (ECS) JSON encoder. Privacy
-  redaction runs before encoding so private and sensitive segments
-  never reach the wire as plaintext.
-- **M3.2** -- Ordered delivery pipeline that POSTs encoded records
-  to the configured intake URL with batching, retry,
+- **M3.2** -- Ordered delivery pipeline that POSTs the encoded ECS
+  JSON to the configured intake URL with batching, retry,
   flush-on-lifecycle, and bounded backpressure. The universal
   `Logger` contract stays synchronous; ordering is the adapter's
   responsibility, not the call site's.
@@ -113,14 +110,13 @@ created and passed in; the same protocol carries plain strings,
 privacy-aware interpolation, and structured attributes.
 
 `intakeURL` configures the first-party intake URL described above.
-The M3.2 delivery pipeline will POST encoded records here; the M3.0
-scaffold only stores the value. `serviceName` is the value the M3.1
-encoder will stamp as the ECS `service.name` field on every emitted
-record (use the app or library name, for example `"demo-ios"`); the
-M3.0 scaffold stores it verbatim and does not yet read it.
-`minimumLevel` is the drop-guard threshold; entries strictly below
-it (and `LoggerLevel.disabled`) are dropped without evaluating the
-message or attributes.
+The M3.2 delivery pipeline will POST encoded records here; the M3.1
+release stores the value but does not issue any network requests.
+`serviceName` is the value the encoder stamps as the ECS
+`service.name` field on every encoded record (use the app or library
+name, for example `"demo-ios"`). `minimumLevel` is the drop-guard
+threshold; entries strictly below it (and `LoggerLevel.disabled`)
+are dropped without evaluating the message or attributes.
 
 ```swift
 import LoggerElastic
@@ -133,9 +129,9 @@ let logger: any Loggers.Logger = ElasticLogger(
 )
 ```
 
-> In M3.0, allowed entries are accepted and discarded; no encoding or
-> network delivery occurs yet. The encoder lands in M3.1 and the
-> ordered delivery pipeline lands in M3.2.
+> In M3.1, allowed entries are materialized once, redacted, and
+> ECS-encoded; the encoded `Data` is then discarded because the
+> network transport lands in M3.2. M3.1 still performs no network I/O.
 
 ## Severities
 
@@ -159,6 +155,56 @@ logger that drops every entry instead of configuring a threshold.
 
 The default `MinimumLevel` is `warning`, matching
 `MinimumLevel.defaultLevel`.
+
+## ECS encoding
+
+In M3.1, this encoding is performed locally and the resulting
+`Data` is discarded; it becomes the on-wire format once M3.2
+lands the delivery pipeline.
+
+Every allowed entry is encoded as a single JSON object using the
+following Elastic Common Schema fields:
+
+| Field            | Source                                                |
+|------------------|-------------------------------------------------------|
+| `@timestamp`     | adapter wall-clock timestamp at materialization time, ISO 8601 UTC with millisecond precision (for example `2026-04-30T12:00:00.123Z`) |
+| `log.level`      | `LoggerLevel.rawValue` -- `trace`, `debug`, `info`, `notice`, `warning`, `error`, or `critical` |
+| `message`        | redacted message text; private segments become `<private>` and sensitive segments become `<redacted>` |
+| `service.name`   | the `serviceName` passed to `ElasticLogger`           |
+| `event.dataset`  | the literal string `swift-loggers`                    |
+| `logger.domain`  | `LoggerDomain.rawValue`                               |
+
+User attributes are emitted as top-level dotted keys, with their
+values encoded as JSON-native types: `LogValue.string` becomes a
+JSON string, `.integer` and `.double` become numbers (non-finite
+doubles -- `NaN`, `+infinity`, `-infinity` -- are coerced to JSON
+`null`), `.bool` becomes a boolean, `.date` becomes the same ISO
+8601 string format as `@timestamp`, `.array` and `.object`
+recurse, and `.null` becomes JSON `null`. A private attribute's
+value is replaced with the literal `"<private>"` and a sensitive
+attribute's with `"<redacted>"` before encoding.
+
+If a user attribute's key collides with one of the six reserved
+fields above (or with `labels` itself), the attribute is moved
+into a nested `labels` object under its original key. The
+canonical fields are never overwritten by user attributes:
+
+```json
+{
+  "@timestamp": "2026-04-30T12:00:00.123Z",
+  "log.level": "info",
+  "message": "User opened screen",
+  "service.name": "demo-ios",
+  "event.dataset": "swift-loggers",
+  "logger.domain": "Network",
+  "labels": {
+    "@timestamp": "user-supplied value, kept here instead of overwriting the canonical field"
+  }
+}
+```
+
+Top-level keys are emitted in sorted order so the output is
+byte-stable for identical inputs and easy to diff in tests.
 
 ## Companion packages
 
