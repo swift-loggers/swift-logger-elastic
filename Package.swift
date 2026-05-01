@@ -24,6 +24,12 @@ let package = Package(
         .target(
             name: "LoggerElastic",
             dependencies: [
+                // The library target keeps a minimal dependency on
+                // the protocol-only `Loggers` product. The
+                // `LoggerLibrary` umbrella is what consumers
+                // declare in their own Package.swift (per the
+                // install snippet in README), not something this
+                // target re-imports for its own use.
                 .product(name: "Loggers", package: "swift-logger")
             ]
         ),

@@ -29,14 +29,22 @@ private func recordEvaluationAndReturn<T>(
     return value
 }
 
+private func makeIntakeURL() throws -> URL {
+    try #require(URL(string: "https://logs.example.com/elastic"))
+}
+
 private func makeLogger(
-    minimumLevel: ElasticLogger.MinimumLevel = .trace
+    minimumLevel: ElasticLogger.MinimumLevel = .trace,
+    transport: any BulkTransport = RecordingTransport(),
+    dateProvider: @escaping @Sendable () -> Date = { Date(timeIntervalSince1970: 0) }
 ) throws -> ElasticLogger {
-    let url = try #require(URL(string: "https://logs.example.com/elastic"))
+    let url = try makeIntakeURL()
     return ElasticLogger(
-        intakeURL: url,
+        endpoint: .intake(url: url, authorizationHeader: nil),
         serviceName: "test-service",
-        minimumLevel: minimumLevel
+        minimumLevel: minimumLevel,
+        dateProvider: dateProvider,
+        transport: transport
     )
 }
 
@@ -44,30 +52,84 @@ private func makeLogger(
 struct ElasticLoggerTests {
     // MARK: Locked surface
 
-    @Test("Initializer stores intakeURL, serviceName, and minimumLevel")
+    @Test("Initializer stores endpoint, serviceName, and minimumLevel")
     func initializerStoresLockedSurface() throws {
-        let url = try #require(URL(string: "https://logs.example.com/elastic"))
+        let url = try makeIntakeURL()
         let logger = ElasticLogger(
-            intakeURL: url,
+            endpoint: .intake(url: url, authorizationHeader: "Bearer xyz"),
             serviceName: "demo-ios",
             minimumLevel: .info
         )
 
-        #expect(logger.intakeURL == url)
         #expect(logger.serviceName == "demo-ios")
         #expect(logger.minimumLevel == .info)
+        guard case let .intake(storedURL, header) = logger.endpoint else {
+            Issue.record("expected .intake")
+            return
+        }
+        #expect(storedURL == url)
+        #expect(header == "Bearer xyz")
     }
 
     @Test("MinimumLevel default is .warning")
     func minimumLevelDefaultIsWarning() throws {
-        let url = try #require(URL(string: "https://logs.example.com/elastic"))
+        let url = try makeIntakeURL()
         let logger = ElasticLogger(
-            intakeURL: url,
+            endpoint: .intake(url: url, authorizationHeader: nil),
             serviceName: "demo-ios"
         )
 
         #expect(logger.minimumLevel == .warning)
         #expect(ElasticLogger.MinimumLevel.defaultLevel == .warning)
+    }
+
+    @Test("Public initializer without `urlSession` keeps the locked surface")
+    func publicInitWithoutURLSessionPreservesLockedSurface() throws {
+        let url = try makeIntakeURL()
+        let logger = ElasticLogger(
+            endpoint: .intake(url: url, authorizationHeader: "Bearer xyz"),
+            serviceName: "demo-ios",
+            minimumLevel: .info
+        )
+
+        #expect(logger.serviceName == "demo-ios")
+        #expect(logger.minimumLevel == .info)
+        guard case let .intake(storedURL, header) = logger.endpoint else {
+            Issue.record("expected .intake")
+            return
+        }
+        #expect(storedURL == url)
+        #expect(header == "Bearer xyz")
+    }
+
+    @Test("Public initializer accepts an explicit URLSession for enterprise networking")
+    func publicInitAcceptsExplicitURLSession() throws {
+        let url = try makeIntakeURL()
+        // Build a session with a non-default configuration that
+        // an enterprise consumer would typically use (custom
+        // timeouts, host filter, etc.). We only verify the public
+        // surface compiles and that the locked properties read
+        // back unchanged; the concrete URLSession is held inside
+        // the internal transport and is not part of the public
+        // API.
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 5
+        let session = URLSession(configuration: configuration)
+        let logger = ElasticLogger(
+            endpoint: .elasticsearch(url: url, apiKey: "abc123"),
+            serviceName: "demo-ios",
+            minimumLevel: .warning,
+            urlSession: session
+        )
+
+        #expect(logger.serviceName == "demo-ios")
+        #expect(logger.minimumLevel == .warning)
+        guard case let .elasticsearch(storedURL, apiKey) = logger.endpoint else {
+            Issue.record("expected .elasticsearch")
+            return
+        }
+        #expect(storedURL == url)
+        #expect(apiKey == "abc123")
     }
 
     @Test("MinimumLevel.allCases is the seven severities in canonical order")
@@ -131,7 +193,8 @@ struct ElasticLoggerTests {
     func disabledIsDroppedWithoutEvaluation() throws {
         let messageCounter = CallCounter()
         let attributesCounter = CallCounter()
-        let logger = try makeLogger(minimumLevel: .trace)
+        let transport = RecordingTransport()
+        let logger = try makeLogger(minimumLevel: .trace, transport: transport)
 
         logger.log(
             .disabled,
@@ -142,13 +205,15 @@ struct ElasticLoggerTests {
 
         #expect(messageCounter.value == 0)
         #expect(attributesCounter.value == 0)
+        #expect(transport.sent.isEmpty)
     }
 
     @Test("Below-threshold level drops without evaluating message or attributes")
     func belowThresholdIsDroppedWithoutEvaluation() throws {
         let messageCounter = CallCounter()
         let attributesCounter = CallCounter()
-        let logger = try makeLogger(minimumLevel: .warning)
+        let transport = RecordingTransport()
+        let logger = try makeLogger(minimumLevel: .warning, transport: transport)
 
         logger.log(
             .info,
@@ -159,6 +224,27 @@ struct ElasticLoggerTests {
 
         #expect(messageCounter.value == 0)
         #expect(attributesCounter.value == 0)
+        #expect(transport.sent.isEmpty)
+    }
+
+    @Test("Dropped entries do not call the transport")
+    func droppedEntriesDoNotCallTransport() async throws {
+        let url = try makeIntakeURL()
+        let transport = RecordingTransport()
+        let logger = ElasticLogger(
+            endpoint: .intake(url: url, authorizationHeader: nil),
+            serviceName: "demo-ios",
+            minimumLevel: .warning,
+            dateProvider: { Date(timeIntervalSince1970: 0) },
+            transport: transport
+        )
+
+        logger.log(.info, "Network", "below threshold", attributes: [])
+        logger.log(.disabled, "Network", "disabled sentinel", attributes: [])
+
+        // Allow any spurious async dispatch to surface.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(transport.sent.isEmpty)
     }
 
     // MARK: Single-evaluation invariant
@@ -183,19 +269,19 @@ struct ElasticLoggerTests {
         #expect(attributesCounter.value == 1)
     }
 
-    // MARK: End-to-end encode path
+    // MARK: End-to-end delivery path
 
-    @Test("Allowed entry produces one ECS-encoded payload")
-    func allowedEntryProducesOneEncodedPayload() throws {
-        let url = try #require(URL(string: "https://logs.example.com/elastic"))
-        let recorder = PayloadRecorder()
+    @Test("Allowed entry POSTs one ECS-encoded document through the transport")
+    func allowedEntryProducesOneTransportCall() async throws {
+        let url = try makeIntakeURL()
+        let transport = RecordingTransport()
         let fixedDate = Date(timeIntervalSince1970: 1_777_550_400.123)
         let logger = ElasticLogger(
-            intakeURL: url,
+            endpoint: .intake(url: url, authorizationHeader: "Bearer abc"),
             serviceName: "demo-ios",
             minimumLevel: .trace,
             dateProvider: { fixedDate },
-            onEncoded: { data in recorder.record(data) }
+            transport: transport
         )
 
         logger.log(
@@ -204,12 +290,18 @@ struct ElasticLoggerTests {
             "User opened screen",
             attributes: [LogAttribute("auth.method", "password")]
         )
+        await waitForSendCount(1, on: transport)
 
-        let payload = try #require(recorder.payloads.first)
-        #expect(recorder.payloads.count == 1)
+        try #require(transport.sent.count == 1)
+        let call = transport.sent[0]
 
+        #expect(call.url == url)
+        #expect(call.headers["Content-Type"] == "application/x-ndjson")
+        #expect(call.headers["Authorization"] == "Bearer abc")
+
+        let document = try ecsDocumentLine(from: call.body)
         let decoded = try #require(
-            try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+            try JSONSerialization.jsonObject(with: document) as? [String: Any]
         )
         #expect(decoded["@timestamp"] as? String == "2026-04-30T12:00:00.123Z")
         #expect(decoded["log.level"] as? String == "info")
@@ -220,85 +312,24 @@ struct ElasticLoggerTests {
         #expect(decoded["auth.method"] as? String == "password")
     }
 
-    @Test("Allowed entry redacts private and sensitive content before encoding")
-    func allowedEntryRedactsBeforeEncoding() throws {
-        let url = try #require(URL(string: "https://logs.example.com/elastic"))
-        let recorder = PayloadRecorder()
-        let logger = ElasticLogger(
-            intakeURL: url,
-            serviceName: "demo-ios",
-            minimumLevel: .trace,
-            dateProvider: { Date(timeIntervalSince1970: 0) },
-            onEncoded: { data in recorder.record(data) }
-        )
-
-        // Mix all three privacy levels in both message and
-        // attributes so a missing redact-before-encode step would
-        // surface as plaintext somewhere in the payload.
-        logger.log(
-            .info,
-            "Auth",
-            LogMessage(segments: [
-                LogSegment("user="),
-                LogSegment("alice", privacy: .private),
-                LogSegment(" token="),
-                LogSegment("api-token-xyz", privacy: .sensitive)
-            ]),
-            attributes: [
-                LogAttribute("auth.method", "password"),
-                LogAttribute("auth.username", "alice", privacy: .private),
-                LogAttribute("auth.token", "tk-99-secret", privacy: .sensitive)
-            ]
-        )
-
-        let payload = try #require(recorder.payloads.first)
-        #expect(recorder.payloads.count == 1)
-
-        let decoded = try #require(
-            try JSONSerialization.jsonObject(with: payload) as? [String: Any]
-        )
-
-        // Decoded view: message is rendered with the redacted
-        // markers, public attribute is preserved verbatim, and
-        // private / sensitive attribute values are replaced with
-        // their redacted literals before reaching the encoder.
-        #expect(decoded["message"] as? String == "user=<private> token=<redacted>")
-        #expect(decoded["auth.method"] as? String == "password")
-        #expect(decoded["auth.username"] as? String == "<private>")
-        #expect(decoded["auth.token"] as? String == "<redacted>")
-
-        // Raw-JSON view: the original plaintext values must not
-        // appear anywhere in the encoded `Data`. This pins the
-        // invariant that redaction runs before encoding (and
-        // therefore before any future enqueue / persistence point
-        // that the M3.2 delivery pipeline introduces).
-        let raw = try #require(String(data: payload, encoding: .utf8))
-        for forbidden in ["alice", "api-token-xyz", "tk-99-secret"] {
-            #expect(!raw.contains(forbidden), "leaked: \(forbidden)")
-        }
-        #expect(raw.contains("<private>"))
-        #expect(raw.contains("<redacted>"))
-    }
-
-    @Test("Allowed entry materializes, redacts, and encodes payload after the drop guard")
-    func allowedEntryFullPipeline() throws {
-        let url = try #require(URL(string: "https://logs.example.com/elastic"))
-        let recorder = PayloadRecorder()
+    @Test("Allowed entry materializes, redacts, encodes, and POSTs after the drop guard")
+    func allowedEntryFullPipeline() async throws {
+        let url = try makeIntakeURL()
+        let transport = RecordingTransport()
         let messageCounter = CallCounter()
         let attributesCounter = CallCounter()
         let logger = ElasticLogger(
-            intakeURL: url,
+            endpoint: .intake(url: url, authorizationHeader: nil),
             serviceName: "demo-ios",
             minimumLevel: .trace,
             dateProvider: { Date(timeIntervalSince1970: 0) },
-            onEncoded: { data in recorder.record(data) }
+            transport: transport
         )
 
-        // `.info` at `.trace` threshold passes the drop guard.
-        // Mix one private and one sensitive segment in the message
-        // so the redacted shape pins both literals, and use both a
-        // private and a sensitive attribute so the same coverage
-        // applies to attribute redaction.
+        // `.info` at `.trace` threshold passes the drop guard. Mix
+        // private and sensitive segments in the message and a
+        // private and a sensitive attribute so the redacted shape
+        // pins both literals end-to-end.
         logger.log(
             .info,
             "Auth",
@@ -319,15 +350,17 @@ struct ElasticLoggerTests {
                 ]
             )
         )
+        await waitForSendCount(1, on: transport)
 
-        // Hard-require exactly one payload before indexing so a
-        // zero- or multi-payload regression fails fast instead of
-        // crashing the test process on an out-of-bounds index.
-        try #require(recorder.payloads.count == 1)
-        let payload = recorder.payloads[0]
+        // Hard-require exactly one transport call before indexing
+        // so a zero-call regression fails fast instead of crashing
+        // the test process on an out-of-bounds index.
+        try #require(transport.sent.count == 1)
+        let call = transport.sent[0]
 
+        let document = try ecsDocumentLine(from: call.body)
         let decoded = try #require(
-            try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+            try JSONSerialization.jsonObject(with: document) as? [String: Any]
         )
 
         // Redaction ran before the encoder: message segments are
@@ -338,9 +371,9 @@ struct ElasticLoggerTests {
         #expect(decoded["session.token"] as? String == "<redacted>")
 
         // Raw-JSON view: the original plaintext must not appear
-        // anywhere in the encoded `Data`, which pins the
+        // anywhere in the encoded body, which pins the
         // redact-before-encode contract end-to-end.
-        let raw = try #require(String(data: payload, encoding: .utf8))
+        let raw = try #require(String(data: call.body, encoding: .utf8))
         #expect(!raw.contains("alice"))
         #expect(!raw.contains("secret-token"))
         #expect(raw.contains("<private>"))
@@ -348,48 +381,37 @@ struct ElasticLoggerTests {
 
         // Single-evaluation: the autoclosures are evaluated exactly
         // once on the allowed path, even though the value flows
-        // through the redactor and the encoder.
+        // through the redactor, the encoder, and the FIFO worker.
         #expect(messageCounter.value == 1)
         #expect(attributesCounter.value == 1)
     }
 
-    @Test("Below-threshold and disabled entries do not reach the encoded sink")
-    func droppedEntriesDoNotReachSink() throws {
-        let url = try #require(URL(string: "https://logs.example.com/elastic"))
-        let recorder = PayloadRecorder()
+    // MARK: Direct mode integration
+
+    @Test("Direct endpoint POSTs the encoded payload to <url>/_bulk with ApiKey auth")
+    func directEndpointEndToEnd() async throws {
+        let cluster = try #require(URL(string: "https://es.example.com"))
+        let transport = RecordingTransport()
         let logger = ElasticLogger(
-            intakeURL: url,
+            endpoint: .elasticsearch(url: cluster, apiKey: "abc123"),
             serviceName: "demo-ios",
-            minimumLevel: .warning,
+            minimumLevel: .trace,
             dateProvider: { Date(timeIntervalSince1970: 0) },
-            onEncoded: { data in recorder.record(data) }
+            transport: transport
         )
 
-        logger.log(.info, "Network", "below threshold", attributes: [])
-        logger.log(.disabled, "Network", "disabled sentinel", attributes: [])
+        logger.log(.info, "Network", "hello", attributes: [])
+        await waitForSendCount(1, on: transport)
 
-        #expect(recorder.payloads.isEmpty)
-    }
-}
+        try #require(transport.sent.count == 1)
+        let call = transport.sent[0]
 
-private final class PayloadRecorder: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: [Data] = []
+        #expect(call.url.absoluteString == "https://es.example.com/_bulk")
+        #expect(call.headers["Authorization"] == "ApiKey abc123")
+        #expect(call.headers["Content-Type"] == "application/x-ndjson")
 
-    var payloads: [Data] {
-        lock.lock()
-        defer { lock.unlock() }
-        // Return a defensive snapshot so the caller owns its own
-        // array buffer after the lock is released. Plain `return
-        // stored` would share buffer storage with the recorder via
-        // copy-on-write, which is fine for sequential reads but
-        // brittle to reason about under concurrent recording.
-        return stored.map { $0 }
-    }
-
-    func record(_ data: Data) {
-        lock.lock()
-        defer { lock.unlock() }
-        stored.append(data)
+        let raw = try #require(String(data: call.body, encoding: .utf8))
+        #expect(raw.hasPrefix(#"{"create":{"_index":"logs-swift-loggers-default"}}"# + "\n"))
+        #expect(raw.hasSuffix("\n"))
     }
 }
