@@ -1,11 +1,14 @@
 import Foundation
 import Loggers
 
-/// A `Logger` adapter that materializes, redacts, and ECS-encodes
-/// each allowed entry for delivery to a first-party Elasticsearch
-/// intake / proxy endpoint.
+/// A `Logger` adapter that materializes, redacts, ECS-encodes, and
+/// enqueues each allowed entry for best-effort delivery to an
+/// Elasticsearch cluster directly or to a consumer-owned intake /
+/// proxy endpoint. Accepted entries are drained from a bounded
+/// FIFO buffer toward the transport; the adapter does not
+/// guarantee that every enqueued entry reaches the destination.
 ///
-/// ## Status: M3.1 (this release)
+/// ## Status: M3.2 (this release)
 ///
 /// For each allowed entry the adapter:
 ///
@@ -14,39 +17,56 @@ import Loggers
 /// 2. builds a `LogRecord` stamped with a wall-clock timestamp,
 /// 3. runs the record through an internal redactor that replaces
 ///    private segments and attribute values with `<private>` and
-///    sensitive ones with `<redacted>`, and
+///    sensitive ones with `<redacted>`,
 /// 4. encodes the redacted record as Elastic Common Schema (ECS)
-///    JSON.
+///    JSON, and
+/// 5. enqueues the encoded payload onto an ordered FIFO worker
+///    that POSTs an NDJSON `_bulk` body to the configured
+///    ``ElasticEndpoint``.
 ///
-/// The encoded `Data` is intentionally discarded today; the M3.2
-/// delivery pipeline will pick it up. **M3.1 still performs no
-/// network I/O.** Entries strictly below the configured
-/// ``MinimumLevel`` and entries at `LoggerLevel.disabled` are
-/// dropped without evaluating the message or attributes
-/// autoclosures.
-///
-/// The encoder and redactor are intentionally internal in this
-/// release; the swappable contract for them lands together with the
-/// shared remote-adapter API once M3.2 and a second remote sink
-/// inform the protocol shape.
-///
-/// ## Planned behavior (M3.2)
-///
-/// Once the M3.2 delivery pipeline lands, this adapter will POST
-/// the encoded ECS JSON to ``intakeURL`` through an ordered queue
-/// with batching, retry, flush-on-lifecycle, and bounded
-/// backpressure. The universal `Logger` contract stays synchronous;
+/// Entries strictly below the configured ``MinimumLevel`` and
+/// entries at `LoggerLevel.disabled` are dropped without evaluating
+/// the message or attributes autoclosures, and never reach the
+/// transport. The `Logger` protocol contract stays synchronous;
 /// ordering is the adapter's responsibility, not the call site's.
+///
+/// The internal FIFO queue is bounded. When the consumer cannot
+/// keep up (slow network, offline transport) the worker keeps the
+/// oldest queued payloads moving and **drops new entries on the
+/// producer side** once the buffer hits its capacity (1000
+/// payloads by default). Payloads that fail to deliver --
+/// HTTP errors, item-level `_bulk` failures, network timeouts,
+/// the device being offline -- are dropped on the floor; the
+/// buffer lives only in memory, so reconnecting (or relaunching
+/// the app) does not replay previously failed payloads. M3.2
+/// does not expose a public flush / retry / backpressure surface;
+/// the bounded buffer is the only overload-handling primitive
+/// available in this release.
+///
+/// The encoder, redactor, transport, and FIFO worker are
+/// intentionally internal in this release. The shared
+/// remote-adapter API (swappable encoder, swappable transport,
+/// retry / batching configuration, public backpressure) is held
+/// back until at least M3.3 and a second remote sink can inform
+/// the protocol shape, so the surface is not frozen prematurely.
 ///
 /// ## Threat model
 ///
-/// `intakeURL` is a **first-party intake / proxy endpoint** owned by
-/// the consumer. Direct Elasticsearch endpoints take server-side API
-/// keys, which must not be embedded in a client app. The primary
-/// initializer therefore deliberately does **not** accept an
-/// `apiKey`, `token`, or generic `headers` argument; the proxy
-/// terminates client traffic and forwards to Elasticsearch with the
-/// real credential server-side.
+/// `ElasticEndpoint.elasticsearch(url:apiKey:)` is a supported
+/// **informed opt-in**: an API key compiled into a client app
+/// binary is extractable, so the cluster behind that key inherits
+/// the trust level of the distribution channel. Direct mode is
+/// appropriate for trial setups, smoke tests, internal-only apps,
+/// prototypes, and any context where the operator has consciously
+/// accepted that risk.
+///
+/// `ElasticEndpoint.intake(url:authorizationHeader:)` is the
+/// recommended hardened-production shape. The intake URL is a
+/// consumer-owned proxy / gateway / APM endpoint; the real cluster
+/// credential lives on the server side and never ships with the
+/// client. Bearer, Basic, custom gateway tokens, or no auth are
+/// supported through `.intake(url:authorizationHeader:)` because
+/// the intake endpoint is consumer-owned.
 public struct ElasticLogger: Loggers.Logger {
     /// A severity threshold for ``ElasticLogger``.
     ///
@@ -87,11 +107,11 @@ public struct ElasticLogger: Loggers.Logger {
         public static let defaultLevel = MinimumLevel.warning
     }
 
-    /// The first-party intake / proxy endpoint configured for this
-    /// logger. Once the M3.2 delivery pipeline lands, encoded records
-    /// will be POSTed here; in M3.1 the URL is stored but no request
-    /// is issued.
-    public let intakeURL: URL
+    /// The destination encoded ECS records are POSTed to and the
+    /// credentials used to reach it. See ``ElasticEndpoint`` for
+    /// the two supported delivery shapes (direct Elasticsearch and
+    /// consumer-owned intake).
+    public let endpoint: ElasticEndpoint
 
     /// The value the encoder stamps as the ECS `service.name` field
     /// on every encoded record. Typically the app or library name,
@@ -102,74 +122,74 @@ public struct ElasticLogger: Loggers.Logger {
     /// severity is strictly lower than this value -- and entries at
     /// `LoggerLevel.disabled` -- are dropped without evaluating the
     /// message or attributes autoclosures. Entries at or above this
-    /// value are materialized, redacted, and ECS-encoded; the
-    /// encoded payload is discarded today and will be POSTed to
-    /// ``intakeURL`` once the M3.2 delivery pipeline lands.
+    /// value are materialized, redacted, ECS-encoded, and enqueued
+    /// onto the worker's bounded buffer. Only entries the buffer
+    /// accepts are drained toward the configured ``ElasticEndpoint``;
+    /// yields the buffer drops under sustained overload never reach
+    /// the transport, and even accepted entries are delivered on a
+    /// best-effort basis without retry or durability.
     public let minimumLevel: MinimumLevel
 
-    /// Wall-clock source used to stamp `LogRecord.timestamp` when an
-    /// allowed entry is materialized. Defaults to `Date.init`; the
-    /// tests inject a fixed clock so golden ECS JSON output is
-    /// byte-stable.
     private let dateProvider: @Sendable () -> Date
-
-    /// Internal redactor applied to every materialized record before
-    /// it reaches the encoder. Stateless and not configurable in M3.1.
     private let redactor: DefaultRedactor
-
-    /// Internal ECS encoder. Stateless and not configurable in M3.1.
     private let encoder: ECSEncoder
+    private let worker: DeliveryWorker
 
-    /// Internal sink that receives every successfully encoded payload.
-    /// Defaults to a no-op so production callers see no behavior
-    /// change; tests inject a recorder to assert that allowed entries
-    /// reach the encoder and produce a valid ECS document. Once the
-    /// M3.2 delivery pipeline lands, this seam is replaced by the
-    /// ordered enqueue path and removed from the public surface.
-    private let onEncoded: @Sendable (Data) -> Void
-
-    /// Creates an `ElasticLogger`.
+    /// Creates an `ElasticLogger` that POSTs encoded ECS records to
+    /// the supplied ``ElasticEndpoint``.
     ///
     /// - Parameters:
-    ///   - intakeURL: The first-party intake / proxy endpoint. Must
-    ///     not be a direct Elasticsearch endpoint that requires an
-    ///     API key embedded in the client.
+    ///   - endpoint: The delivery destination plus credentials. See
+    ///     ``ElasticEndpoint`` for direct vs intake semantics and
+    ///     for the trust-model trade-offs.
     ///   - serviceName: The value emitted as the ECS `service.name`
     ///     field on every encoded record.
     ///   - minimumLevel: The minimum severity to emit. Defaults to
     ///     ``MinimumLevel/defaultLevel``.
+    ///   - urlSession: The `URLSession` used for the underlying
+    ///     `_bulk` POSTs. Defaults to `URLSession.shared`. Pass a
+    ///     pre-configured session here for enterprise networking
+    ///     concerns -- certificate pinning or mTLS via a custom
+    ///     `URLSessionDelegate`, an enterprise HTTP proxy via the
+    ///     session's `URLSessionConfiguration`, custom timeout
+    ///     policy, or a custom `URLProtocol`. The injected session
+    ///     does not control retry, backpressure, batching, or any
+    ///     of the delivery semantics M3.2 documents -- those stay
+    ///     fixed in this release.
     public init(
-        intakeURL: URL,
+        endpoint: ElasticEndpoint,
         serviceName: String,
-        minimumLevel: MinimumLevel = .defaultLevel
+        minimumLevel: MinimumLevel = .defaultLevel,
+        urlSession: URLSession = .shared
     ) {
         self.init(
-            intakeURL: intakeURL,
+            endpoint: endpoint,
             serviceName: serviceName,
             minimumLevel: minimumLevel,
             dateProvider: { Date() },
-            onEncoded: { _ in }
+            transport: URLSessionBulkTransport(session: urlSession)
         )
     }
 
     /// Creates an `ElasticLogger` with an injected wall-clock source
-    /// and an injected encoded-payload sink. Internal so production
-    /// callers cannot depend on either seam while tests can pin a
-    /// deterministic timestamp and observe what the encoder produces.
+    /// and an injected transport. Internal so production callers
+    /// cannot depend on either seam while tests can pin a
+    /// deterministic timestamp and capture the request that the
+    /// transport would have made on the network.
     init(
-        intakeURL: URL,
+        endpoint: ElasticEndpoint,
         serviceName: String,
         minimumLevel: MinimumLevel = .defaultLevel,
         dateProvider: @escaping @Sendable () -> Date,
-        onEncoded: @escaping @Sendable (Data) -> Void = { _ in }
+        transport: any BulkTransport
     ) {
-        self.intakeURL = intakeURL
+        self.endpoint = endpoint
         self.serviceName = serviceName
         self.minimumLevel = minimumLevel
         self.dateProvider = dateProvider
-        self.onEncoded = onEncoded
         redactor = DefaultRedactor()
         encoder = ECSEncoder()
+        worker = DeliveryWorker(transport: transport, endpoint: endpoint)
     }
 
     public func log(
@@ -188,11 +208,7 @@ public struct ElasticLogger: Loggers.Logger {
         )
         let redacted = redactor.redact(record)
         let encoded = encoder.encode(redacted, serviceName: serviceName)
-        // M3.1: hand the encoded payload to the internal sink. In
-        // production the sink is a no-op (network I/O lands in M3.2);
-        // in tests it is a recorder that pins the integration path
-        // end-to-end.
-        onEncoded(encoded)
+        worker.enqueue(encoded)
     }
 
     /// Returns whether an entry at the given severity passes the
