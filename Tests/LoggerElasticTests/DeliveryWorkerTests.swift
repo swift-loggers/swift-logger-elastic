@@ -141,7 +141,7 @@ struct DeliveryWorkerTests {
 
     // MARK: Bulk response validation
 
-    @Test("Direct endpoint swallows item-level _bulk failures without blocking later payloads")
+    @Test("Direct endpoint swallows top-level _bulk error responses without blocking later payloads")
     func directEndpointHandlesBulkItemFailures() async throws {
         let cluster = try #require(URL(string: "https://es.example.com"))
         let transport = RecordingTransport()

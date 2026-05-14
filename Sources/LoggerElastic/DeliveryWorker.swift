@@ -25,21 +25,25 @@ import Foundation
 /// `bufferingOldest(queueCapacity)`, so when the consumer cannot
 /// keep up (slow network, offline transport) the buffer fills to
 /// `queueCapacity` and subsequent yields are dropped on the floor
-/// rather than accumulated without limit. A public flush /
-/// backpressure surface lands in a follow-up milestone; the
-/// bounded buffer keeps memory predictable in the meantime.
+/// rather than accumulated without limit. The bounded buffer
+/// keeps memory predictable; hosts that need durable delivery
+/// with explicit retry / backpressure / acknowledgement use
+/// ``ElasticRemoteEngine`` instead.
 ///
 /// For `.elasticsearch` endpoints the worker also validates the
-/// response body: the `_bulk` API returns HTTP 200 with
-/// `"errors": true` when individual items fail, so a successful
-/// HTTP round-trip is not by itself proof of delivery. For
-/// `.intake` endpoints the response is opaque and only the HTTP
-/// status code matters.
+/// response body with the top-level `_bulk` envelope validator:
+/// the `_bulk` API returns HTTP 200 with `"errors": true` when
+/// Elasticsearch reports a bulk error response, so a successful
+/// HTTP round-trip is not by itself proof of delivery. This is not
+/// the durable parser's per-item semantics. For `.intake`
+/// endpoints the response is opaque and only the HTTP status code
+/// matters.
 ///
-/// Transport failures (HTTP errors, item-level bulk errors) are
-/// swallowed by design in M3.2 v1: the logging path is sync and
-/// infallible, and a failed request cannot propagate back to the
-/// caller. Subsequent payloads continue to flow.
+/// Transport failures (HTTP errors, top-level bulk error responses) are
+/// swallowed by design on the best-effort `ElasticLogger` path:
+/// the logging path is sync and infallible, and a failed request
+/// cannot propagate back to the caller. Subsequent payloads
+/// continue to flow.
 ///
 /// Lifetime: the consumer task is retained as a stored property.
 /// `deinit` finishes the stream and requests cancellation so the
@@ -100,12 +104,15 @@ final class DeliveryWorker: Sendable {
                     // the pre-send check above.
                     break
                 } catch {
-                    // M3.2 v1: swallow non-cancellation failures.
-                    // Logging path stays infallible; a
-                    // failure-surfacing API lands in a follow-up
-                    // milestone. If cancellation arrived between
-                    // the throw and here, exit anyway so the loop
-                    // does not race with `task.cancel()`.
+                    // Best-effort `ElasticLogger` contract:
+                    // swallow non-cancellation failures. The
+                    // `ElasticLogger` path stays infallible by
+                    // design; hosts that need durable delivery,
+                    // retry, or per-failure diagnostics use
+                    // `ElasticRemoteEngine` instead. If
+                    // cancellation arrived between the throw and
+                    // here, exit anyway so the loop does not race
+                    // with `task.cancel()`.
                     if Task.isCancelled { break }
                 }
             }
@@ -118,9 +125,10 @@ final class DeliveryWorker: Sendable {
     /// dropped** when the bounded buffer is already at capacity;
     /// `AsyncStream.Continuation.yield` returns a result indicating
     /// whether the value was buffered, terminated, or dropped, and
-    /// M3.2 intentionally does not expose that result to callers.
-    /// A future flush / backpressure / overflow surface will surface
-    /// the drop signal explicitly.
+    /// the best-effort `ElasticLogger` path intentionally does not
+    /// expose that result to callers. Durable flush / retry /
+    /// per-item failure diagnostics already exist through
+    /// `ElasticRemoteEngine` and are not goals of this worker.
     func enqueue(_ payload: Data) {
         // The result of `yield` is intentionally discarded: the
         // bounded-buffer drop is part of the documented contract,

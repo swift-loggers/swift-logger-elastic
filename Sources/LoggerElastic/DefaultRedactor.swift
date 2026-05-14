@@ -4,11 +4,14 @@ import Loggers
 /// Internal redactor that strips private and sensitive content from a
 /// ``LogRecord`` before any encoding or persistence step.
 ///
-/// `DefaultRedactor` is intentionally not part of the public surface
-/// in M3.1. The contract for a swappable redactor is held back until
-/// the shared remote-adapter API is informed by an actual delivery
-/// pipeline (M3.2) and a second sink, so the protocol shape can be
-/// driven by real needs rather than frozen prematurely.
+/// `DefaultRedactor` is internal to the package. It runs on every
+/// record the best-effort `ElasticLogger` path emits, ahead of
+/// ECS encoding and ahead of the worker's bounded buffer; the
+/// durable `ElasticRemoteEngine` path does not invoke this
+/// redactor because callers there hand pre-encoded `_bulk`
+/// document bytes to `DurableRemoteQueue.enqueue(_:)` directly and
+/// own any redaction upstream of enqueue. Callers using the durable
+/// path must redact before `DurableRemoteQueue.enqueue(_:)`.
 ///
 /// The redactor enforces the privacy contract documented on the core
 /// types:
@@ -23,9 +26,9 @@ import Loggers
 /// segments and `.public` attribute values, so any downstream
 /// encoder can ignore privacy annotations and treat the payload as
 /// safe-to-emit text. Running the redactor before encoding is a hard
-/// invariant: the M3.2 delivery pipeline will only see redacted
-/// records, so a leaked plaintext value cannot reach a retry queue,
-/// disk persistence, or the wire.
+/// invariant on the `ElasticLogger` path: the in-process worker
+/// only ever sees redacted records, so a leaked plaintext value
+/// cannot reach the bounded buffer or the wire.
 struct DefaultRedactor: Sendable {
     /// Returns a copy of `record` with private and sensitive content
     /// replaced by the redacted literals.

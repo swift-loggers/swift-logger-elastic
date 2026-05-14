@@ -8,8 +8,6 @@ import Loggers
 /// FIFO buffer toward the transport; the adapter does not
 /// guarantee that every enqueued entry reaches the destination.
 ///
-/// ## Status: M3.2 (this release)
-///
 /// For each allowed entry the adapter:
 ///
 /// 1. evaluates the `message` and `attributes` autoclosures exactly
@@ -35,20 +33,18 @@ import Loggers
 /// oldest queued payloads moving and **drops new entries on the
 /// producer side** once the buffer hits its capacity (1000
 /// payloads by default). Payloads that fail to deliver --
-/// HTTP errors, item-level `_bulk` failures, network timeouts,
+/// HTTP errors, top-level `_bulk` error responses, network timeouts,
 /// the device being offline -- are dropped on the floor; the
 /// buffer lives only in memory, so reconnecting (or relaunching
-/// the app) does not replay previously failed payloads. M3.2
-/// does not expose a public flush / retry / backpressure surface;
-/// the bounded buffer is the only overload-handling primitive
-/// available in this release.
+/// the app) does not replay previously failed payloads.
 ///
-/// The encoder, redactor, transport, and FIFO worker are
-/// intentionally internal in this release. The shared
-/// remote-adapter API (swappable encoder, swappable transport,
-/// retry / batching configuration, public backpressure) is held
-/// back until at least M3.3 and a second remote sink can inform
-/// the protocol shape, so the surface is not frozen prematurely.
+/// `ElasticLogger` is the best-effort path; hosts
+/// that need durable delivery, retry, or per-failure diagnostics
+/// use ``ElasticRemoteEngine`` instead. The encoder, redactor,
+/// transport, and FIFO worker are intentionally internal on this
+/// path; the surface stays narrow because the best-effort contract
+/// is the entire contract — there is no swappable retry / batching
+/// layer to configure here.
 ///
 /// ## Threat model
 ///
@@ -125,8 +121,8 @@ public struct ElasticLogger: Loggers.Logger {
     /// value are materialized, redacted, ECS-encoded, and enqueued
     /// onto the worker's bounded buffer. Only entries the buffer
     /// accepts are drained toward the configured ``ElasticEndpoint``;
-    /// yields the buffer drops under sustained overload never reach
-    /// the transport, and even accepted entries are delivered on a
+    /// entries the buffer drops under sustained overload never reach
+    /// the transport. Even accepted entries are delivered on a
     /// best-effort basis without retry or durability.
     public let minimumLevel: MinimumLevel
 
@@ -154,8 +150,9 @@ public struct ElasticLogger: Loggers.Logger {
     ///     session's `URLSessionConfiguration`, custom timeout
     ///     policy, or a custom `URLProtocol`. The injected session
     ///     does not control retry, backpressure, batching, or any
-    ///     of the delivery semantics M3.2 documents -- those stay
-    ///     fixed in this release.
+    ///     of the best-effort delivery semantics this path
+    ///     documents — those are fixed at the drop-newest /
+    ///     no-retry / no-durable-queue contract above.
     public init(
         endpoint: ElasticEndpoint,
         serviceName: String,
