@@ -1,7 +1,7 @@
 import Foundation
 
-/// The destination an ``ElasticLogger`` writes encoded ECS records
-/// to, plus the credentials needed to reach it.
+/// The destination an ``ElasticLogger`` writes encoded `_bulk`
+/// document payloads to, plus the credentials needed to reach it.
 ///
 /// `ElasticEndpoint` has two cases that correspond to two distinct
 /// deployment shapes; pick the one that matches your trust model.
@@ -26,10 +26,11 @@ import Foundation
 /// ## ``ElasticEndpoint/intake(url:authorizationHeader:)``
 ///
 /// Delivery through a first-party intake / proxy / gateway endpoint
-/// owned by the consumer. The adapter sends the encoded ECS record
-/// to `url` verbatim -- it does **not** append `/_bulk` -- and lets
-/// the intake decide its own URL conventions, indexing, rate
-/// limiting, and onward routing to Elasticsearch.
+/// owned by the consumer. The adapter POSTs the framed NDJSON
+/// `_bulk` body to `url` verbatim -- it does **not** append
+/// `/_bulk` -- and lets the intake decide its own URL
+/// conventions, indexing, rate limiting, and onward routing to
+/// Elasticsearch.
 ///
 /// `authorizationHeader` is sent verbatim as the value of the
 /// `Authorization` request header. Bearer, Basic, custom gateway
@@ -63,10 +64,10 @@ public enum ElasticEndpoint: Sendable {
 }
 
 extension ElasticEndpoint {
-    /// The URL the adapter POSTs encoded records to. Direct mode
-    /// appends `/_bulk` to the configured cluster URL; intake mode
-    /// returns the configured URL verbatim so the intake decides
-    /// its own URL conventions.
+    /// The URL the adapter POSTs framed NDJSON `_bulk` bodies to.
+    /// Direct mode appends `/_bulk` to the configured cluster URL;
+    /// intake mode returns the configured URL verbatim so the
+    /// intake decides its own URL conventions.
     var requestURL: URL {
         switch self {
         case let .elasticsearch(url, _):

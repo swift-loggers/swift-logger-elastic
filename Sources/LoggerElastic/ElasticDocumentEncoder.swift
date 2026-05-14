@@ -1,15 +1,31 @@
 import Foundation
 import Loggers
 
-/// Sink-owned ECS / `_bulk` document encoder for the best-effort
-/// ``ElasticLogger`` path.
+/// Sink-owned `_bulk` document encoder for the best-effort
+/// ``ElasticLogger`` path. The default
+/// ``DefaultElasticDocumentEncoder`` emits Elastic Common Schema
+/// JSON; custom conformances are free to emit any single-line
+/// JSON document shape that satisfies the returned-bytes
+/// contract below.
 ///
 /// The encoder runs after the configured ``ElasticRecordRedactor``
 /// has replaced private and sensitive segments and before the
 /// bounded FIFO worker. It returns the JSON **document** bytes the
 /// adapter wraps in NDJSON `_bulk` action + document framing.
-/// Encoders MUST NOT emit the action line themselves and MUST NOT
-/// append a trailing newline.
+///
+/// **Returned-bytes contract:**
+///
+/// - Encoders return **one compact single-line JSON document**.
+/// - Encoders MUST NOT emit the `_bulk` action line themselves —
+///   the adapter prepends `{"create":{"_index":"..."}}\n` on the
+///   wire.
+/// - Encoders MUST NOT include raw newline (`0x0A`) bytes
+///   anywhere in the returned bytes — not as a trailing
+///   terminator, not inside a pretty-printed document, not as a
+///   field separator. The adapter terminates the document with
+///   exactly one `0x0A` on the wire; a raw newline anywhere
+///   inside the returned bytes would split one logical document
+///   into multiple NDJSON lines and corrupt `_bulk` framing.
 ///
 /// `encode(_:serviceName:)` is allowed to throw. A throwing
 /// encoder is treated as a best-effort drop at the call site: the
@@ -18,6 +34,12 @@ import Loggers
 /// ``ElasticLoggerDiagnostic/encodingFailed(_:)``, and the logger
 /// continues processing later entries. `ElasticLogger.log` stays
 /// synchronous and infallible regardless of encoder behaviour.
+///
+/// **Concurrency.** `encode(_:serviceName:)` may be invoked
+/// concurrently from multiple threads when concurrent
+/// `ElasticLogger.log` calls fire. Custom encoders MUST be
+/// reentrant and thread-safe; the default
+/// ``DefaultElasticDocumentEncoder`` satisfies this contract.
 ///
 /// The durable ``ElasticRemoteEngine`` path does not invoke this
 /// encoder. Durable callers hand pre-encoded `_bulk` document bytes

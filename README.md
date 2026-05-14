@@ -10,14 +10,17 @@ contracts. Pick the one that matches your operational requirements.
 ### Best-effort `ElasticLogger` — in-process buffer
 
 `ElasticLogger` materializes each allowed entry, redacts private
-and sensitive content, encodes it as Elastic Common Schema (ECS)
-JSON, and enqueues the payload to a bounded in-process FIFO worker
-for delivery to the configured `ElasticEndpoint`. Privacy-safe
-rendering is applied during materialization, lazy evaluation of
-message and attributes is preserved, and the seven-severity model
-maps to the canonical ECS `log.level` strings during encoding.
-Records that reach Elasticsearch can be queried there and
-visualized in Kibana.
+and sensitive content, encodes it through the configured
+`ElasticDocumentEncoder` (`DefaultElasticDocumentEncoder` emits
+Elastic Common Schema (ECS) JSON), and enqueues the payload to a
+bounded in-process FIFO worker for delivery to the configured
+`ElasticEndpoint`. Privacy-safe
+rendering is applied during materialization, and lazy evaluation
+of message and attributes is preserved.
+`DefaultElasticDocumentEncoder` maps the seven-severity model to
+canonical ECS `log.level` strings; custom encoders are free to
+project severity differently. Records that reach Elasticsearch
+can be queried there and visualized in Kibana.
 
 **This path is best-effort.** The worker uses a fixed-capacity
 buffer (1000 payloads by default) with **drop-newest
@@ -182,9 +185,11 @@ with an ``ElasticEndpoint`` and passed in; the same protocol carries
 plain strings, privacy-aware interpolation, and structured
 attributes.
 
-`serviceName` is the value the encoder stamps as the ECS
-`service.name` field on every record. `minimumLevel` is the
-drop-guard threshold; entries strictly below it (and
+`serviceName` is the value passed to the configured
+`ElasticDocumentEncoder`; `DefaultElasticDocumentEncoder` emits
+it as the ECS `service.name` field on every encoded document, and
+custom encoders are free to project or ignore it. `minimumLevel`
+is the drop-guard threshold; entries strictly below it (and
 `LoggerLevel.disabled`) are dropped without evaluating the message
 or attributes.
 
@@ -438,10 +443,11 @@ logger that drops every entry instead of configuring a threshold.
 The default `MinimumLevel` is `warning`, matching
 `MinimumLevel.defaultLevel`.
 
-## ECS encoding
+## Default ECS encoding
 
-Every allowed entry is encoded as a single JSON object using the
-following Elastic Common Schema fields:
+With `DefaultElasticDocumentEncoder`, every allowed entry is
+encoded as a single JSON object using the following Elastic
+Common Schema fields:
 
 | Field            | Source                                                |
 |------------------|-------------------------------------------------------|
@@ -486,20 +492,25 @@ byte-stable for identical inputs and easy to diff in tests.
 
 ## Wire format
 
-On the best-effort path, every encoded record is wrapped in a
-two-line NDJSON `_bulk` body:
+On the best-effort path, every encoded document payload is
+wrapped in a two-line NDJSON `_bulk` body:
 
 ```
 {"create":{"_index":"logs-swift-loggers-default"}}
-<ECS document>
+<document JSON>
 ```
 
-(each line terminated by `\n`). On the best-effort path, the action
-line targets the ECS data-streams convention
-`logs-<event.dataset>-default`, which resolves to
-`logs-swift-loggers-default` and matches the `event.dataset` field
-stamped on every record. The durable path uses the same per-document
-NDJSON framing inside each dispatched batch, but builds one `_bulk`
+(each line terminated by `\n`). On the best-effort path the
+action line targets the built-in direct index
+`logs-swift-loggers-default`, which matches
+`DefaultElasticDocumentEncoder`'s `event.dataset` value. Custom
+best-effort `ElasticDocumentEncoder` implementations reuse the
+same built-in direct index and are not required to emit an
+`event.dataset` field of their own; hosts that need a different
+index target route through an intake endpoint (consumer-owned
+proxy) or the durable `ElasticRemoteEngine` configuration
+instead. The durable path uses the same per-document NDJSON
+framing inside each dispatched batch, but builds one `_bulk`
 request per dispatched batch round; its `_index` comes from
 `ElasticRemoteEngine.Configuration.indexName` (default:
 `logs-swift-loggers-default`). Requests are sent with

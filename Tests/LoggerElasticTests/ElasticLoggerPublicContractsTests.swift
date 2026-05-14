@@ -66,15 +66,26 @@ struct ElasticLoggerPublicContractsTests {
     // MARK: Custom encoder
 
     /// Custom encoder that emits a minimal JSON document
-    /// `{"custom":"<message>","sn":"<serviceName>"}` so the test
-    /// can prove the adapter actually went through the injected
-    /// encoder (custom keys, not the default ECS field names) AND
-    /// that the `serviceName` argument reached the encoder.
+    /// `{"custom":"<message>","sn":"<serviceName>","sensitive":"<value>"}`
+    /// so the test can prove the adapter actually went through the
+    /// injected encoder (custom keys, not the default ECS field
+    /// names), that the `serviceName` argument reached the
+    /// encoder, AND that the record reached the encoder already
+    /// **redacted** (the encoder reads the sensitive attribute
+    /// value verbatim — if it sees the raw plaintext, redaction
+    /// did not run before the encoder).
     private struct CustomEncoder: ElasticDocumentEncoder {
         func encode(_ record: LogRecord, serviceName: String) -> Data {
+            var sensitive = "<missing>"
+            for attribute in record.attributes where attribute.key == "user.token" {
+                if case let .string(value) = attribute.value {
+                    sensitive = value
+                }
+            }
             let payload = [
                 "custom": record.message.redactedDescription,
-                "sn": serviceName
+                "sn": serviceName,
+                "sensitive": sensitive
             ]
             // The test fixture inputs only contain JSON-safe values
             // and the encoder cannot legitimately fail on them, so
@@ -91,7 +102,23 @@ struct ElasticLoggerPublicContractsTests {
             transport: transport,
             encoder: CustomEncoder()
         )
-        logger.log(.info, "Application", "custom-doc", attributes: [])
+        // Sensitive attribute MUST be replaced with `<redacted>`
+        // before the custom encoder sees it. If redaction did not
+        // run, the custom encoder would surface the plaintext
+        // through the `sensitive` key and the assertion below
+        // would fail.
+        logger.log(
+            .info,
+            "Application",
+            "custom-doc",
+            attributes: [
+                LogAttribute(
+                    "user.token",
+                    .string("plaintext-must-not-leak"),
+                    privacy: .sensitive
+                )
+            ]
+        )
         await waitForSendCount(1, on: transport)
 
         let sent = try #require(transport.sent.first)
@@ -107,6 +134,9 @@ struct ElasticLoggerPublicContractsTests {
         #expect(object["sn"] as? String == "contracts-test")
         #expect(object["message"] == nil)
         #expect(object["service.name"] == nil)
+        // Redaction-before-encoding proof: the encoder saw the
+        // redacted value, not the original plaintext.
+        #expect(object["sensitive"] as? String == "<redacted>")
     }
 
     // MARK: Encoder failure diagnostic
@@ -338,5 +368,84 @@ struct ElasticLoggerPublicContractsTests {
         let object = try #require(parsed as? [String: Any])
         #expect(object["user.email"] as? String == "<private>")
         #expect(object["user.token"] as? String == "<redacted>")
+    }
+
+    // MARK: Public initializer forwarding proof
+
+    /// Sentinel error raised by the inspecting encoder used in
+    /// ``publicInitializerForwardsCustomSeams``. Carries the
+    /// values the encoder observed so the test can assert
+    /// forwarding without touching the network.
+    private struct ForwardingProofError: Error, Sendable, Equatable {
+        let serviceName: String
+        let messageText: String
+    }
+
+    /// Encoder that throws after capturing the inputs it saw.
+    /// Because the encoder always throws, the entry is dropped at
+    /// the encode step and the transport is never invoked — the
+    /// test does not need a real network or a `BulkTransport`
+    /// stub. The `onDiagnostic` callback receives the captured
+    /// error and the assertions read its fields.
+    private struct InspectingEncoder: ElasticDocumentEncoder {
+        func encode(_ record: LogRecord, serviceName: String) throws -> Data {
+            throw ForwardingProofError(
+                serviceName: serviceName,
+                messageText: record.message.redactedDescription
+            )
+        }
+    }
+
+    @Test("Public initializer forwards custom encoder + redactor + onDiagnostic")
+    func publicInitializerForwardsCustomSeams() throws {
+        // Public init path with the network endpoint set to an
+        // intake URL we never reach: the inspecting encoder throws
+        // BEFORE the transport is invoked, so the test stays
+        // network-free without any internal seam.
+        let intakeURL = try Self.intakeURL()
+        let recorder = DiagnosticRecorder()
+        let logger = ElasticLogger(
+            endpoint: .intake(url: intakeURL, authorizationHeader: nil),
+            serviceName: "forwarding-test",
+            minimumLevel: .trace,
+            encoder: InspectingEncoder(),
+            redactor: UppercaseRedactor(),
+            onDiagnostic: { recorder.append($0) }
+        )
+
+        logger.log(
+            .info,
+            "Forwarding",
+            "probe",
+            attributes: [
+                LogAttribute(
+                    "user.token",
+                    .string("plaintext-must-not-leak"),
+                    privacy: .sensitive
+                )
+            ]
+        )
+
+        // Encoder threw inside `log`; the diagnostic is recorded
+        // synchronously on the producer thread, so no wait is
+        // needed before reading the recorder.
+        let snapshot = recorder.snapshot
+        #expect(snapshot.count == 1)
+        guard case let .encodingFailed(error) = snapshot.first,
+              let proof = error as? ForwardingProofError
+        else {
+            Issue.record("expected .encodingFailed(ForwardingProofError) from public init path")
+            return
+        }
+        // Three seams the public init forwards:
+        // 1. `serviceName` reached the encoder.
+        // 2. The custom `redactor` ran before the encoder — the
+        //    message text is uppercased by `UppercaseRedactor`
+        //    rather than the input `probe`.
+        // 3. The custom `onDiagnostic` callback received the
+        //    encoder's throw (covered by the `case let
+        //    .encodingFailed(error)` match above).
+        #expect(proof.serviceName == "forwarding-test")
+        #expect(proof.messageText == "PROBE")
     }
 }
