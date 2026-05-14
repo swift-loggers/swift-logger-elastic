@@ -54,11 +54,16 @@ enum BulkTransportError: Error, Sendable, Equatable {
     case bulkItemFailures
 
     /// The body returned for a direct `_bulk` request did not
-    /// match the documented Elasticsearch response shape (empty
-    /// body, non-JSON, or JSON without a top-level boolean
-    /// `errors` field). This usually means an upstream proxy
-    /// rewrote the response or the URL did not actually point at
-    /// an Elasticsearch cluster.
+    /// match the documented Elasticsearch response shape: an
+    /// empty body, a non-JSON body, JSON without a top-level
+    /// boolean `errors` field, a missing or non-array `items`
+    /// field, or an `items` array whose length is not `1` (the
+    /// best-effort direct path POSTs exactly one document per
+    /// request, so any other item count fails closed here). This
+    /// usually means an upstream proxy rewrote the response, the
+    /// URL did not actually point at an Elasticsearch cluster, or
+    /// the server answered a request the best-effort path never
+    /// issued.
     case malformedBulkResponse
 }
 
@@ -107,23 +112,31 @@ struct URLSessionBulkTransport: BulkTransport, @unchecked Sendable {
 /// response shape: a top-level JSON object that always includes a
 /// boolean `errors` field and an `items` array.
 ///
-/// The validator checks only the top-level response envelope for
-/// the direct best-effort path and intentionally does not validate
-/// per-item response semantics, item count, or per-item action
-/// object shape.
+/// The validator checks the top-level response envelope and the
+/// item count for the direct best-effort path. Per-item action
+/// object shape inside `items` is **not** validated here — that
+/// belongs to the durable response parser in
+/// ``ElasticBulkResponseParser`` — but the count is, because the
+/// best-effort path always POSTs **exactly one** document per
+/// `_bulk` request, so a response carrying anything other than one
+/// item entry is a protocol violation regardless of the per-item
+/// shape.
 ///
-/// - `"errors": false` together with an `items` array is an
-///   accepted top-level envelope and returns without throwing.
-/// - `"errors": true` together with an `items` array throws
-///   ``BulkTransportError/bulkItemFailures``.
+/// - `"errors": false` together with an `items` array of length
+///   one is an accepted top-level envelope and returns without
+///   throwing.
+/// - `"errors": true` together with an `items` array of length
+///   one throws ``BulkTransportError/bulkItemFailures``.
 /// - Anything else -- empty body, non-JSON body, non-object JSON
 ///   top-level (a top-level array, string, number, bool, or null),
-///   missing or non-boolean `errors` field, or missing or
-///   non-array `items` field -- is treated as a malformed response
-///   and throws ``BulkTransportError/malformedBulkResponse``.
-///   That shape typically means an upstream proxy rewrote the
-///   response, or the URL did not actually point at an
-///   Elasticsearch cluster.
+///   missing or non-boolean `errors` field, missing or non-array
+///   `items` field, or an `items` array whose length is not one --
+///   is treated as a malformed response and throws
+///   ``BulkTransportError/malformedBulkResponse``. That shape
+///   typically means an upstream proxy rewrote the response, the
+///   URL did not actually point at an Elasticsearch cluster, or
+///   the server answered a request the best-effort path never
+///   issued.
 ///
 /// The validator is **not** invoked for ``ElasticEndpoint/intake(url:authorizationHeader:)``
 /// endpoints, where the response body is opaque by design (a
@@ -140,7 +153,14 @@ func validateElasticBulkResponse(_ data: Data) throws {
     guard let errors = object["errors"] as? Bool else {
         throw BulkTransportError.malformedBulkResponse
     }
-    guard object["items"] is [Any] else {
+    guard let items = object["items"] as? [Any] else {
+        throw BulkTransportError.malformedBulkResponse
+    }
+    // Best-effort direct path POSTs exactly one document per
+    // `_bulk` request; a response items array of any other length
+    // does not correlate with the request the worker sent. Refuse
+    // fail-closed rather than guess which item is "the" item.
+    guard items.count == 1 else {
         throw BulkTransportError.malformedBulkResponse
     }
     if errors {

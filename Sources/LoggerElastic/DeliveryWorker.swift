@@ -57,16 +57,19 @@ final class DeliveryWorker: Sendable {
 
     private let continuation: AsyncStream<Data>.Continuation
     private let task: Task<Void, Never>
+    private let onBufferOverflow: (@Sendable () -> Void)?
 
     init(
         transport: any BulkTransport,
         endpoint: ElasticEndpoint,
-        queueCapacity: Int = DeliveryWorker.defaultQueueCapacity
+        queueCapacity: Int = DeliveryWorker.defaultQueueCapacity,
+        onBufferOverflow: (@Sendable () -> Void)? = nil
     ) {
         let (stream, continuation) = AsyncStream<Data>.makeStream(
             bufferingPolicy: .bufferingOldest(queueCapacity)
         )
         self.continuation = continuation
+        self.onBufferOverflow = onBufferOverflow
 
         let validatesBulkResponse: Bool = {
             if case .elasticsearch = endpoint { return true }
@@ -121,19 +124,38 @@ final class DeliveryWorker: Sendable {
 
     /// Enqueues an ECS-encoded document for delivery.
     ///
-    /// Synchronous and thread-safe. The yield is **silently
-    /// dropped** when the bounded buffer is already at capacity;
-    /// `AsyncStream.Continuation.yield` returns a result indicating
-    /// whether the value was buffered, terminated, or dropped, and
-    /// the best-effort `ElasticLogger` path intentionally does not
-    /// expose that result to callers. Durable flush / retry /
-    /// per-item failure diagnostics already exist through
-    /// `ElasticRemoteEngine` and are not goals of this worker.
+    /// Synchronous and thread-safe. When the bounded buffer is at
+    /// capacity the yield is rejected (drop-newest contract); the
+    /// rejected document never reaches the transport. The rejection
+    /// fires the worker's `onBufferOverflow` callback —
+    /// ``ElasticLogger`` wires that callback to its
+    /// ``ElasticLoggerDiagnostic/bufferOverflow`` signal so hosts
+    /// can observe drop events without making `log` async or
+    /// throwing.
     func enqueue(_ payload: Data) {
-        // The result of `yield` is intentionally discarded: the
-        // bounded-buffer drop is part of the documented contract,
-        // not a per-call error to propagate.
-        _ = continuation.yield(payload)
+        let result = continuation.yield(payload)
+        switch result {
+        case .enqueued:
+            break
+        case .dropped:
+            // `.bufferingOldest` rejected the yield because the
+            // buffer is at capacity. Fire the observable signal so
+            // the host can react (metric, secondary log channel)
+            // without changing the synchronous infallible
+            // `Logger.log` contract.
+            onBufferOverflow?()
+        case .terminated:
+            // The stream was already finished (deinit raced the
+            // yield). The payload is dropped; firing the overflow
+            // signal at lifecycle teardown would be a false
+            // positive, so do nothing.
+            break
+        @unknown default:
+            // Future yield outcomes default to drop semantics from
+            // the host's perspective: the payload did not reach
+            // the transport.
+            onBufferOverflow?()
+        }
     }
 
     deinit {

@@ -33,18 +33,24 @@ import Loggers
 /// oldest queued payloads moving and **drops new entries on the
 /// producer side** once the buffer hits its capacity (1000
 /// payloads by default). Payloads that fail to deliver --
-/// HTTP errors, top-level `_bulk` error responses, network timeouts,
-/// the device being offline -- are dropped on the floor; the
-/// buffer lives only in memory, so reconnecting (or relaunching
-/// the app) does not replay previously failed payloads.
+/// HTTP errors, malformed direct `_bulk` responses / invalid
+/// envelopes / item-count mismatches, top-level `_bulk` error
+/// responses, network timeouts, the device being offline -- are
+/// dropped on the floor; the buffer lives only in memory, so
+/// reconnecting (or relaunching the app) does not replay
+/// previously failed payloads.
 ///
-/// `ElasticLogger` is the best-effort path; hosts
-/// that need durable delivery, retry, or per-failure diagnostics
-/// use ``ElasticRemoteEngine`` instead. The encoder, redactor,
-/// transport, and FIFO worker are intentionally internal on this
-/// path; the surface stays narrow because the best-effort contract
-/// is the entire contract — there is no swappable retry / batching
-/// layer to configure here.
+/// `ElasticLogger` is the best-effort path; hosts that need
+/// durable delivery, retry, or per-failure diagnostics use
+/// ``ElasticRemoteEngine`` instead. The public customization
+/// surface on this path is locked at three seams:
+/// ``ElasticDocumentEncoder`` (document encoding),
+/// ``ElasticRecordRedactor`` (privacy redaction before encoding),
+/// and the ``ElasticLoggerDiagnostic`` `onDiagnostic` callback
+/// (encoder failures, bounded-buffer overflow). The transport and
+/// FIFO worker stay internal; the surface is narrow because the
+/// best-effort contract is the entire contract — there is no
+/// swappable retry / batching layer to configure here.
 ///
 /// ## Threat model
 ///
@@ -127,8 +133,9 @@ public struct ElasticLogger: Loggers.Logger {
     public let minimumLevel: MinimumLevel
 
     private let dateProvider: @Sendable () -> Date
-    private let redactor: DefaultRedactor
-    private let encoder: ECSEncoder
+    private let redactor: any ElasticRecordRedactor
+    private let encoder: any ElasticDocumentEncoder
+    private let onDiagnostic: (@Sendable (ElasticLoggerDiagnostic) -> Void)?
     private let worker: DeliveryWorker
 
     /// Creates an `ElasticLogger` that POSTs encoded ECS records to
@@ -153,18 +160,43 @@ public struct ElasticLogger: Loggers.Logger {
     ///     of the best-effort delivery semantics this path
     ///     documents — those are fixed at the drop-newest /
     ///     no-retry / no-durable-queue contract above.
+    ///   - encoder: The ``ElasticDocumentEncoder`` used to turn
+    ///     each redacted `LogRecord` into `_bulk` document
+    ///     bytes. Defaults to ``DefaultElasticDocumentEncoder``,
+    ///     which emits Elastic Common Schema JSON. A custom
+    ///     encoder is allowed to throw; throws are reported as
+    ///     ``ElasticLoggerDiagnostic/encodingFailed(_:)`` and the
+    ///     entry is dropped without breaking later entries.
+    ///   - redactor: The ``ElasticRecordRedactor`` invoked before
+    ///     encoding. Defaults to ``DefaultElasticRecordRedactor``,
+    ///     which is fail-closed for unknown privacy. Runs before
+    ///     the worker's bounded buffer so plaintext private /
+    ///     sensitive content cannot leak even when later steps
+    ///     fail.
+    ///   - onDiagnostic: Optional observer for
+    ///     ``ElasticLoggerDiagnostic`` signals (encoder failures,
+    ///     bounded-buffer overflow). Fired synchronously on the
+    ///     producer thread that triggered the signal; the
+    ///     `log(_:_:_:attributes:)` contract stays synchronous and
+    ///     infallible regardless.
     public init(
         endpoint: ElasticEndpoint,
         serviceName: String,
         minimumLevel: MinimumLevel = .defaultLevel,
-        urlSession: URLSession = .shared
+        urlSession: URLSession = .shared,
+        encoder: any ElasticDocumentEncoder = DefaultElasticDocumentEncoder(),
+        redactor: any ElasticRecordRedactor = DefaultElasticRecordRedactor(),
+        onDiagnostic: (@Sendable (ElasticLoggerDiagnostic) -> Void)? = nil
     ) {
         self.init(
             endpoint: endpoint,
             serviceName: serviceName,
             minimumLevel: minimumLevel,
             dateProvider: { Date() },
-            transport: URLSessionBulkTransport(session: urlSession)
+            transport: URLSessionBulkTransport(session: urlSession),
+            encoder: encoder,
+            redactor: redactor,
+            onDiagnostic: onDiagnostic
         )
     }
 
@@ -178,15 +210,28 @@ public struct ElasticLogger: Loggers.Logger {
         serviceName: String,
         minimumLevel: MinimumLevel = .defaultLevel,
         dateProvider: @escaping @Sendable () -> Date,
-        transport: any BulkTransport
+        transport: any BulkTransport,
+        encoder: any ElasticDocumentEncoder = DefaultElasticDocumentEncoder(),
+        redactor: any ElasticRecordRedactor = DefaultElasticRecordRedactor(),
+        onDiagnostic: (@Sendable (ElasticLoggerDiagnostic) -> Void)? = nil,
+        queueCapacity: Int = DeliveryWorker.defaultQueueCapacity
     ) {
         self.endpoint = endpoint
         self.serviceName = serviceName
         self.minimumLevel = minimumLevel
         self.dateProvider = dateProvider
-        redactor = DefaultRedactor()
-        encoder = ECSEncoder()
-        worker = DeliveryWorker(transport: transport, endpoint: endpoint)
+        self.redactor = redactor
+        self.encoder = encoder
+        self.onDiagnostic = onDiagnostic
+        let onBufferOverflow: @Sendable () -> Void = {
+            onDiagnostic?(.bufferOverflow)
+        }
+        worker = DeliveryWorker(
+            transport: transport,
+            endpoint: endpoint,
+            queueCapacity: queueCapacity,
+            onBufferOverflow: onBufferOverflow
+        )
     }
 
     public func log(
@@ -204,7 +249,18 @@ public struct ElasticLogger: Loggers.Logger {
             attributes: attributes()
         )
         let redacted = redactor.redact(record)
-        let encoded = encoder.encode(redacted, serviceName: serviceName)
+        let encoded: Data
+        do {
+            encoded = try encoder.encode(redacted, serviceName: serviceName)
+        } catch {
+            // Best-effort drop: the encoder rejected this entry.
+            // Surface the failure through the diagnostic callback
+            // so hosts can observe it without breaking the
+            // synchronous infallible `log` contract; keep
+            // processing later entries.
+            onDiagnostic?(.encodingFailed(error))
+            return
+        }
         worker.enqueue(encoded)
     }
 

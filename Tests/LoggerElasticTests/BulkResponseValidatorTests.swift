@@ -7,15 +7,18 @@ import Testing
 struct BulkResponseValidatorTests {
     // MARK: Accepted shapes
 
-    @Test("`errors: false` validates as success")
-    func errorsFalseAccepted() throws {
-        let body = Data(#"{"took":3,"errors":false,"items":[]}"#.utf8)
+    @Test("`errors: false` with a single item validates as success")
+    func errorsFalseSingleItemAccepted() throws {
+        let body = Data(
+            #"{"took":3,"errors":false,"items":[{"create":{"status":201}}]}"#
+                .utf8
+        )
         try validateElasticBulkResponse(body)
     }
 
     // MARK: Item-level failures
 
-    @Test("`errors: true` throws bulkItemFailures (exact case)")
+    @Test("`errors: true` with a single item throws bulkItemFailures (exact case)")
     func errorsTrueThrowsBulkItemFailures() {
         let body = Data(
             #"{"took":3,"errors":true,"items":[{"create":{"status":400}}]}"#
@@ -87,6 +90,31 @@ struct BulkResponseValidatorTests {
     @Test("Non-array `items` value throws malformedBulkResponse")
     func nonArrayItemsFieldThrows() {
         let body = Data(#"{"took":3,"errors":false,"items":"oops"}"#.utf8)
+        #expect(throws: BulkTransportError.malformedBulkResponse) {
+            try validateElasticBulkResponse(body)
+        }
+    }
+
+    @Test("`items` array of length zero throws malformedBulkResponse")
+    func zeroItemsThrows() {
+        // Best-effort direct path always POSTs exactly one
+        // document, so a zero-item response does not correlate
+        // with the request the worker sent.
+        let body = Data(#"{"took":3,"errors":false,"items":[]}"#.utf8)
+        #expect(throws: BulkTransportError.malformedBulkResponse) {
+            try validateElasticBulkResponse(body)
+        }
+    }
+
+    @Test("`items` array of length greater than one throws malformedBulkResponse")
+    func multipleItemsThrows() {
+        // Same invariant as the zero-item case: a multi-item
+        // response does not correlate with the worker's
+        // single-document `_bulk` request.
+        let body = Data(
+            #"{"took":3,"errors":false,"items":[{"create":{"status":201}},{"create":{"status":201}}]}"#
+                .utf8
+        )
         #expect(throws: BulkTransportError.malformedBulkResponse) {
             try validateElasticBulkResponse(body)
         }
