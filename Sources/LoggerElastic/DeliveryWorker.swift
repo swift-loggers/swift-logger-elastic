@@ -1,8 +1,8 @@
 import Foundation
 
-/// Internal FIFO worker that wraps an ECS-encoded document into a
-/// two-line NDJSON `_bulk` body and sends it through the configured
-/// transport.
+/// Internal FIFO worker that wraps an encoded `_bulk` document
+/// payload into a two-line NDJSON `_bulk` body and sends it
+/// through the configured transport.
 ///
 /// The worker preserves the order in which yields are **accepted**
 /// by the stream's bounded buffer: ``ElasticLogger/log`` calls
@@ -122,7 +122,7 @@ final class DeliveryWorker: Sendable {
         }
     }
 
-    /// Enqueues an ECS-encoded document for delivery.
+    /// Enqueues an encoded `_bulk` document payload for delivery.
     ///
     /// Synchronous and thread-safe. When the bounded buffer is at
     /// capacity the yield is rejected (drop-newest contract); the

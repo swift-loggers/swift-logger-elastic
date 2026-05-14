@@ -23,6 +23,12 @@ import Loggers
 /// privacy case added by a future `swift-logger` release cannot
 /// silently leak through the adapter before the custom redactor is
 /// updated.
+///
+/// **Concurrency.** `redact(_:)` may be invoked concurrently from
+/// multiple threads when simultaneous `ElasticLogger.log` calls
+/// fire. Custom stateful redactors MUST be reentrant and
+/// thread-safe; ``DefaultElasticRecordRedactor`` is stateless and
+/// satisfies this contract trivially.
 public protocol ElasticRecordRedactor: Sendable {
     /// Returns a redacted copy of `record`. The returned record
     /// MUST carry `.public` privacy on every message segment and

@@ -1,14 +1,21 @@
 import Foundation
 
-/// Internal helper that wraps an ECS-encoded document in the
-/// two-line NDJSON shape the Elasticsearch `_bulk` endpoint expects:
-/// an action line followed by the document, each terminated by a
-/// newline (`0x0A`).
+/// Internal helper that wraps an encoded document in the two-line
+/// NDJSON shape the Elasticsearch `_bulk` endpoint expects: an
+/// action line followed by the document, each terminated by a
+/// newline (`0x0A`). The helper does no document encoding itself;
+/// it only frames bytes the configured encoder produced.
 ///
-/// The action line targets the ECS data-streams convention for
-/// general-purpose log indices: `logs-<dataset>-default` resolves
-/// to `logs-swift-loggers-default`, matching the `event.dataset`
-/// field the encoder stamps on every record.
+/// The built-in direct-path action line targets the ECS
+/// data-streams convention for general-purpose log indices:
+/// `logs-<dataset>-default` resolves to
+/// `logs-swift-loggers-default`, matching the `event.dataset`
+/// field ``DefaultElasticDocumentEncoder`` stamps on every
+/// document. Custom ``ElasticDocumentEncoder`` implementations
+/// reuse this built-in direct index without contributing an
+/// `event.dataset` field of their own; hosts that need a
+/// different index target route through an intake endpoint or
+/// the durable ``ElasticRemoteEngine`` configuration instead.
 enum NDJSONBulkBody {
     /// The fixed action line emitted before every document. Uses
     /// `create` (not `index`) so the request also works against an
@@ -23,7 +30,7 @@ enum NDJSONBulkBody {
     /// instead of re-encoding the string on every call.
     static let actionLineData = Data(actionLine.utf8)
 
-    /// Builds the NDJSON body for a single ECS-encoded document.
+    /// Builds the NDJSON body for a single encoded document.
     /// Layout: `<action line>\n<document>\n`.
     ///
     /// The body always ends with exactly one trailing newline. If
@@ -52,7 +59,7 @@ enum NDJSONBulkBody {
         return body
     }
 
-    /// Builds the NDJSON body for a batch of ECS-encoded documents
+    /// Builds the NDJSON body for a batch of encoded documents
     /// targeting `indexName`. Each document is preceded by its own
     /// `{"create":{"_index":"<indexName>"}}` action line and
     /// followed by a single terminating newline. The whole-body

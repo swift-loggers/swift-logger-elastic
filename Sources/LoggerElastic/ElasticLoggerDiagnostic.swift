@@ -13,6 +13,12 @@ import Foundation
 /// inside the callback; the callback runs on the host's logging
 /// hot path.
 ///
+/// **Concurrency.** Concurrent `ElasticLogger.log` calls may
+/// invoke `onDiagnostic` concurrently from multiple threads. Host
+/// diagnostic sinks MUST be reentrant and thread-safe (e.g. guard
+/// shared counters or arrays with a lock); being non-blocking is
+/// necessary but not sufficient.
+///
 /// `ElasticLogger.log` itself remains synchronous and infallible
 /// regardless of which signals fire.
 public enum ElasticLoggerDiagnostic: Sendable {

@@ -119,4 +119,21 @@ struct BulkResponseValidatorTests {
             try validateElasticBulkResponse(body)
         }
     }
+
+    @Test("`errors: true` with a wrong item count throws malformedBulkResponse (count check runs before errors check)")
+    func errorsTrueWithCountMismatchPrefersMalformed() {
+        // Pins the validation order: count mismatch fails closed
+        // as `malformedBulkResponse` regardless of the top-level
+        // `errors` flag, so a multi-item response (which the
+        // best-effort worker never requests) cannot squeak through
+        // as `bulkItemFailures` and let the caller assume the
+        // shape matched.
+        let body = Data(
+            #"{"took":3,"errors":true,"items":[{"create":{"status":400}},{"create":{"status":400}}]}"#
+                .utf8
+        )
+        #expect(throws: BulkTransportError.malformedBulkResponse) {
+            try validateElasticBulkResponse(body)
+        }
+    }
 }
