@@ -19,15 +19,14 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(url: "https://github.com/swift-loggers/swift-logger.git", branch: "main"),
-        // Pinned to `main` until `swift-logger-remote` ships its
-        // first SemVer tag; this dependency declaration is updated
-        // to a tagged SemVer pin (`exact("0.1.0")` or
-        // `.upToNextMinor(from: "0.1.0")`) before this package
-        // tags its own release. Local reviewers consume *this*
-        // elastic worktree via a `path:` dependency from their
-        // host package.
-        .package(url: "https://github.com/swift-loggers/swift-logger-remote.git", branch: "main"),
+        .package(
+            url: "https://github.com/swift-loggers/swift-logger.git",
+            .upToNextMinor(from: "0.1.0")
+        ),
+        .package(
+            url: "https://github.com/swift-loggers/swift-logger-remote.git",
+            .upToNextMinor(from: "0.1.0")
+        ),
         .package(url: "https://github.com/apple/swift-docc-plugin.git", from: "1.0.0")
     ],
     targets: [

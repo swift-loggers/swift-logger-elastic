@@ -142,17 +142,17 @@ struct DeliveryWorkerTests {
     // MARK: Bulk response validation
 
     @Test("Direct endpoint swallows top-level _bulk error responses without blocking later payloads")
-    func directEndpointHandlesBulkItemFailures() async throws {
+    func directEndpointHandlesTopLevelBulkErrorResponses() async throws {
         let cluster = try #require(URL(string: "https://es.example.com"))
         let transport = RecordingTransport()
-        // Script the response queue so the first send observes the
-        // item-level failure body and the second observes a clean
-        // success body. The queue is consumed under the lock per
-        // send, so the assertion does not race with the worker's
-        // async drain.
+        // Script the response queue so the first send observes a
+        // top-level `errors:true` bulk response and the second
+        // observes a clean success body. The queue is consumed
+        // under the lock per send, so the assertion does not race
+        // with the worker's async drain.
         transport.setResponseBodies([
             Data(#"{"took":3,"errors":true,"items":[{"create":{"status":400}}]}"#.utf8),
-            Data(#"{"took":2,"errors":false,"items":[]}"#.utf8)
+            Data(#"{"took":2,"errors":false,"items":[{"create":{"status":201}}]}"#.utf8)
         ])
         let worker = DeliveryWorker(
             transport: transport,

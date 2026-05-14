@@ -26,9 +26,10 @@ yields are discarded so memory stays predictable when the network
 is slow or offline. The best-effort path has **no retry, no durable
 queue, no flush-on-lifecycle hook, and no acknowledgement back to
 the caller**; payloads that fail to deliver — HTTP errors,
-malformed direct `_bulk` responses / invalid envelopes, top-level
-`_bulk` error responses, network timeouts, the device being offline — are
-dropped on the floor. The buffer lives only in memory, so reconnecting
+malformed direct `_bulk` responses / invalid envelopes /
+item-count mismatches, top-level `_bulk` error responses,
+network timeouts, the device being offline — are dropped on the
+floor. The buffer lives only in memory, so reconnecting
 (or relaunching the app) does not replay previously failed payloads.
 Reach for this path only when the operational contract genuinely is
 "fire and forget".
@@ -49,10 +50,15 @@ request), parses the per-item response, and projects each
 host wires `flush()` from its own lifecycle hooks (background
 notifications, shutdown signals, periodic tasks).
 
-> **0.1.0 public API surface:**
+> **`0.1.0` public API surface (final, locked):**
 >
-> - `ElasticLogger(endpoint:serviceName:minimumLevel:urlSession:)` —
->   the best-effort path.
+> - `ElasticLogger(endpoint:serviceName:minimumLevel:urlSession:encoder:redactor:onDiagnostic:)` —
+>   the best-effort path. `encoder` (default
+>   `DefaultElasticDocumentEncoder`) and `redactor` (default
+>   `DefaultElasticRecordRedactor`) are public customization
+>   seams; `onDiagnostic` observes
+>   `ElasticLoggerDiagnostic.encodingFailed(_:)` and
+>   `ElasticLoggerDiagnostic.bufferOverflow`.
 > - `ElasticRemoteEngine.make(_:)` — the durable path. Returns a
 >   `Wiring` carrying `DurableRemoteQueue` and `RemoteEngine`.
 >   `Configuration` accepts `endpoint`, `indexName`, `queueDirectory`,
@@ -64,8 +70,8 @@ notifications, shutdown signals, periodic tasks).
 > proxy / gateway endpoint with an arbitrary `Authorization`
 > header (or none).
 
-Pre-release. Requires Swift 6.0+. iOS 13.4, macOS 10.15.4,
-tvOS 13.4, watchOS 6.2, visionOS 1. MIT licensed.
+Requires Swift 6.0+. iOS 13.4, macOS 10.15.4, tvOS 13.4,
+watchOS 6.2, visionOS 1. MIT licensed.
 
 API reference (DocC):
 [swift-loggers.github.io/swift-logger-elastic](https://swift-loggers.github.io/swift-logger-elastic/documentation/loggerelastic/).
@@ -131,14 +137,12 @@ authenticates by network position.
 
 Add this package, the core `swift-loggers/swift-logger` package
 (`LoggerLibrary`), and `swift-loggers/swift-logger-remote` to your
-`Package.swift`. This branch is still pre-release, so consume the
-repositories by branch or local `path:` dependency until the dependency
-chain is tagged. The `LoggerLibrary` umbrella product re-exports the
+`Package.swift`. All three pin to their `0.1.x` SemVer line
+through `.upToNextMinor(from: "0.1.0")` once each has shipped its
+`0.1.0` tag. The `LoggerLibrary` umbrella product re-exports the
 core abstractions and the companion adapters (`LoggerPrint`,
-`LoggerFiltering`, `LoggerNoOp`), and is the recommended import for
-consumer code. The snippets below import both `LoggerLibrary` and
-`LoggerRemote`, matching the dependencies declared in the install
-snippet.
+`LoggerFiltering`, `LoggerNoOp`), and is the recommended import
+for consumer code.
 
 ```swift
 // In your Package.swift:
@@ -147,15 +151,15 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/swift-loggers/swift-logger-elastic.git",
-            branch: "main"
+            .upToNextMinor(from: "0.1.0")
         ),
         .package(
             url: "https://github.com/swift-loggers/swift-logger.git",
-            branch: "main"
+            .upToNextMinor(from: "0.1.0")
         ),
         .package(
             url: "https://github.com/swift-loggers/swift-logger-remote.git",
-            branch: "main"
+            .upToNextMinor(from: "0.1.0")
         )
     ],
     targets: [
@@ -273,6 +277,62 @@ above. The durable `ElasticRemoteEngine` path owns its own
 retry / batch / ACK contract through `swift-logger-remote`'s
 engine — see [Durable delivery with `ElasticRemoteEngine`](#durable-delivery-with-elasticremoteengine)
 below.
+
+### Customizing the best-effort path
+
+The best-effort path locks three public customization seams in
+`0.1.0`: the document encoder, the privacy redactor, and the
+diagnostic observer. The defaults match the built-in best-effort behaviour
+(`DefaultElasticDocumentEncoder` emits ECS JSON,
+`DefaultElasticRecordRedactor` enforces the privacy contract with
+fail-closed handling of unknown privacy), so existing call sites
+continue to behave identically without supplying any of these
+parameters.
+
+```swift
+import Foundation
+import LoggerElastic
+import LoggerLibrary
+
+let intakeURL = URL(string: "https://logs.example.com/elastic")!
+let logger: any Logger = ElasticLogger(
+    endpoint: .intake(url: intakeURL, authorizationHeader: "Bearer demo"),
+    serviceName: "demo-ios",
+    minimumLevel: .info,
+    encoder: DefaultElasticDocumentEncoder(),
+    redactor: DefaultElasticRecordRedactor(),
+    onDiagnostic: { diagnostic in
+        switch diagnostic {
+        case let .encodingFailed(error):
+            // Route encoder failures to a fallback log channel
+            // or a metric. The entry is already dropped at this
+            // point; the callback only observes.
+            print("ElasticLogger encoding failed: \(error)")
+        case .bufferOverflow:
+            // The bounded buffer rejected a payload under
+            // sustained overload. Drop-newest semantics applied;
+            // increment an overflow counter or surface it as a
+            // metric.
+            print("ElasticLogger buffer overflow (drop-newest)")
+        }
+    }
+)
+```
+
+`ElasticDocumentEncoder.encode(_:serviceName:)` is allowed to
+throw. The adapter treats a throwing encoder as a best-effort
+drop: the failing entry is dropped, the encoder's error is
+forwarded through `onDiagnostic` as
+`ElasticLoggerDiagnostic.encodingFailed(_:)`, and the logger
+keeps processing later entries. `Logger.log` itself stays
+synchronous and infallible.
+
+Redaction runs **before** encoding and **before** the worker's
+bounded buffer, so plaintext private / sensitive content cannot
+leak into the buffer or the encoder even if a custom encoder
+later throws. Custom redactors SHOULD remain fail-closed for
+unknown privacy so a new privacy case added by a future
+`swift-logger` release cannot silently leak through the adapter.
 
 ## Durable delivery with `ElasticRemoteEngine`
 
@@ -461,19 +521,21 @@ The two delivery paths classify direct `.elasticsearch` responses
 differently — the best-effort path treats `errors: true` as a whole-send
 failure, the durable path classifies per item.
 
-**Best-effort `ElasticLogger`.** The worker validates the response body
-against the documented `_bulk` shape and treats the whole send as
-either success or failure: a top-level JSON object with a boolean
-`errors` field set to `false` **and** an `items` array is a
-success. `errors: true` (any item-level failure inside the
-envelope) is treated as a whole-send failure, and so is an empty
-body, a non-JSON body, a top-level JSON array, a missing or
-non-boolean `errors` field, or a missing or non-array `items`
-field — those shapes typically indicate that an upstream proxy
-rewrote the response or the URL did not actually point at an
-Elasticsearch cluster. Whole-send failures on the best-effort path are
-swallowed by the best-effort worker (no retry, no per-item
-recovery).
+**Best-effort `ElasticLogger`.** The worker POSTs **exactly one**
+document per `_bulk` request, so the validator treats the whole
+send as either success or failure: a top-level JSON object with a
+boolean `errors` field set to `false` **and** an `items` array of
+length exactly `1` is a success. `errors: true` (any item-level
+failure reported inside the envelope) is treated as a whole-send
+failure, and so is an empty body, a non-JSON body, a top-level
+JSON array, a missing or non-boolean `errors` field, a missing or
+non-array `items` field, or an `items` array whose length is not
+`1` (zero-item or multi-item responses do not correlate with the
+single-document request the worker sent) — those shapes typically
+indicate that an upstream proxy rewrote the response or the URL
+did not actually point at an Elasticsearch cluster. Whole-send
+failures on the best-effort path are swallowed by the best-effort
+worker (no retry, no per-item recovery).
 
 **Durable `ElasticRemoteEngine`.** The parser still requires a
 well-formed envelope (top-level object + boolean `errors` + array

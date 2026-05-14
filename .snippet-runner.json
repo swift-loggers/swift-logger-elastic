@@ -6,6 +6,13 @@
       "products": [
         {"name": "LoggerLibrary", "package": "swift-logger"}
       ]
+    },
+    {
+      "url": "https://github.com/swift-loggers/swift-logger-remote.git",
+      "branch": "main",
+      "products": [
+        {"name": "LoggerRemote", "package": "swift-logger-remote"}
+      ]
     }
   ]
 }
