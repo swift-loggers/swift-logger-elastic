@@ -1,26 +1,31 @@
 import Foundation
 
-/// Internal transport seam for the M3.2 delivery pipeline.
+/// Internal HTTP seam shared by the best-effort `ElasticLogger`
+/// worker and the `ElasticRemoteTransport` adapter that bridges
+/// Elastic delivery onto `swift-logger-remote`'s durable engine.
 ///
-/// `BulkTransport` is the surface the ``DeliveryWorker`` calls when
-/// it has an NDJSON body to send. The worker produces the URL,
-/// headers, and body; the transport is responsible for the actual
-/// network round-trip and for returning the response body so the
-/// worker can inspect it. It is **not** part of the public API in
-/// M3.2: the contract for a swappable transport, retry policy,
-/// batching, and backpressure is held back until at least M3.3 and
-/// a second remote sink can inform the protocol shape.
+/// Callers produce the URL, headers, and body for one HTTP request
+/// (a single-document `_bulk` payload for the best-effort worker,
+/// an N-document `_bulk` payload for the batch-aggregating durable
+/// transport); the seam is responsible for the network round-trip
+/// and for returning the response body so the caller can decide
+/// per-item / per-batch classification.
 ///
-/// The default implementation in production is
-/// ``URLSessionBulkTransport``. Tests inject a recorder transport
-/// that captures the request without touching the network.
+/// `BulkTransport` is **not** public API. The production
+/// implementation is `URLSessionBulkTransport`; tests inject a
+/// recorder that captures the request without touching the
+/// network. The package exposes both delivery paths through
+/// higher-level public surfaces — `ElasticLogger` for the
+/// best-effort path and `ElasticRemoteEngine.make(_:)` for the
+/// durable remote-engine path — and neither path requires the
+/// caller to wire a `BulkTransport` directly.
 protocol BulkTransport: Sendable {
     /// Sends `body` as the HTTP body of a POST request to `url`
-    /// with the supplied `headers`. Implementations should treat
-    /// any non-2xx response as a failure and throw.
+    /// with the supplied `headers`. Implementations should throw for
+    /// transport-level request failures and non-2xx HTTP responses.
     ///
     /// - Returns: The response body. Empty when the server returns
-    ///   no body or the body cannot be read; never `nil`.
+    ///   no body; never `nil`.
     func send(
         url: URL,
         headers: [String: String],
@@ -42,9 +47,10 @@ enum BulkTransportError: Error, Sendable, Equatable {
     case invalidResponse
 
     /// The Elasticsearch `_bulk` response returned HTTP 200 but
-    /// reported `"errors": true`, meaning at least one individual
-    /// item in the bulk request failed even though the request as
-    /// a whole was accepted.
+    /// reported `"errors": true`, meaning Elasticsearch's top-level
+    /// bulk-response contract says at least one individual item
+    /// failed for the direct best-effort `_bulk` path even though
+    /// the request as a whole was accepted.
     case bulkItemFailures
 
     /// The body returned for a direct `_bulk` request did not
@@ -101,8 +107,13 @@ struct URLSessionBulkTransport: BulkTransport, @unchecked Sendable {
 /// response shape: a top-level JSON object that always includes a
 /// boolean `errors` field and an `items` array.
 ///
-/// - `"errors": false` together with an `items` array is a
-///   successful round-trip and returns without throwing.
+/// The validator checks only the top-level response envelope for
+/// the direct best-effort path and intentionally does not validate
+/// per-item response semantics, item count, or per-item action
+/// object shape.
+///
+/// - `"errors": false` together with an `items` array is an
+///   accepted top-level envelope and returns without throwing.
 /// - `"errors": true` together with an `items` array throws
 ///   ``BulkTransportError/bulkItemFailures``.
 /// - Anything else -- empty body, non-JSON body, non-object JSON

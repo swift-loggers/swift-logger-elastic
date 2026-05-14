@@ -4,12 +4,12 @@ import Loggers
 /// Internal encoder that turns a redacted ``LogRecord`` into Elastic
 /// Common Schema (ECS) JSON.
 ///
-/// `ECSEncoder` is intentionally not part of the public surface in
-/// M3.1. The shared remote-adapter API (encoder protocol, redactor
-/// protocol, batching, retry) is held back until at least the M3.2
-/// delivery pipeline and a second remote adapter are in flight, so
-/// the protocol shape can be informed by real consumers rather than
-/// frozen prematurely.
+/// `ECSEncoder` is internal to the package. It is the encoder the
+/// best-effort `ElasticLogger` path uses to build the JSON document
+/// it hands to the bounded FIFO worker; the durable
+/// `ElasticRemoteEngine` path does not invoke this encoder because
+/// callers there hand pre-encoded `_bulk` document bytes to
+/// `DurableRemoteQueue.enqueue(_:)` directly.
 ///
 /// The encoder assumes its input has already been redacted by
 /// ``DefaultRedactor``: private and sensitive segments must already

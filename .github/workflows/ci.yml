@@ -23,7 +23,8 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     outputs:
-      ci_relevant: ${{ steps.filter.outputs.ci_relevant }}
+      code_relevant: ${{ steps.filter.outputs.code_relevant }}
+      docs_relevant: ${{ steps.filter.outputs.docs_relevant }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,8 +32,11 @@ jobs:
       - uses: dorny/paths-filter@v3
         id: filter
         with:
+          # Two filters so a `README.md`-only PR triggers the DocC
+          # gate (and only the DocC gate). Workflow files appear in
+          # both filters because they can affect either pipeline.
           filters: |
-            ci_relevant:
+            code_relevant:
               - 'Package.swift'
               - 'Package.resolved'
               - 'Sources/**'
@@ -41,11 +45,15 @@ jobs:
               - '.swiftformat'
               - '.swiftlint.yml'
               - '.swift-version'
+              - '.periphery.yml'
+            docs_relevant:
+              - 'README.md'
+              - '.github/workflows/**'
 
   lint:
     name: Lint
     needs: changes
-    if: needs.changes.outputs.ci_relevant == 'true' || github.event.action == 'ready_for_review'
+    if: needs.changes.outputs.code_relevant == 'true' || github.event.action == 'ready_for_review'
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -72,6 +80,15 @@ jobs:
       - name: SwiftLint strict
         run: swiftlint --strict
 
+      - name: Build (verbose) for SwiftLint analyzer
+        shell: bash
+        run: |
+          set -o pipefail
+          swift build --build-tests -v 2>&1 | tee build.log
+
+      - name: SwiftLint analyze (analyzer rules)
+        run: swiftlint analyze --compiler-log-path build.log --strict
+
       - name: Whitespace check
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
@@ -84,7 +101,7 @@ jobs:
   test:
     name: Test (strict concurrency)
     needs: changes
-    if: needs.changes.outputs.ci_relevant == 'true' || github.event.action == 'ready_for_review'
+    if: needs.changes.outputs.code_relevant == 'true' || github.event.action == 'ready_for_review'
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -101,7 +118,7 @@ jobs:
   build-release:
     name: Build (release)
     needs: changes
-    if: needs.changes.outputs.ci_relevant == 'true' || github.event.action == 'ready_for_review'
+    if: needs.changes.outputs.code_relevant == 'true' || github.event.action == 'ready_for_review'
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -115,10 +132,33 @@ jobs:
       - name: Build release
         run: swift build -c release -Xswiftc -warnings-as-errors
 
+  periphery:
+    name: Periphery (unused code)
+    needs: changes
+    if: needs.changes.outputs.code_relevant == 'true' || github.event.action == 'ready_for_review'
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tool versions
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Install Periphery
+        run: brew install peripheryapp/periphery/periphery
+
+      - name: Periphery tool version
+        run: periphery version
+
+      - name: Periphery scan
+        run: periphery scan
+
   library-evolution:
     name: Build (library evolution)
     needs: changes
-    if: needs.changes.outputs.ci_relevant == 'true' || github.event.action == 'ready_for_review'
+    if: needs.changes.outputs.code_relevant == 'true' || github.event.action == 'ready_for_review'
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -135,7 +175,10 @@ jobs:
   docc:
     name: DocC (${{ matrix.product }})
     needs: changes
-    if: github.event_name == 'pull_request' && (needs.changes.outputs.ci_relevant == 'true' || github.event.action == 'ready_for_review')
+    # DocC additionally fires for docs-only PRs (e.g. README) so a
+    # docs change still validates that the generated documentation
+    # builds. Other jobs gate on `code_relevant` only.
+    if: github.event_name == 'pull_request' && (needs.changes.outputs.code_relevant == 'true' || needs.changes.outputs.docs_relevant == 'true' || github.event.action == 'ready_for_review')
     runs-on: macos-latest
     timeout-minutes: 10
     strategy:
@@ -152,7 +195,12 @@ jobs:
 
       - name: DocC build
         run: |
-          swift package --allow-writing-to-directory ./docs \
+          DOCS_OUTPUT="$(mktemp -d "${RUNNER_TEMP}/docc-output.XXXXXX")"
+          swift package --allow-writing-to-directory "$DOCS_OUTPUT" \
             generate-documentation \
             --target ${{ matrix.product }} \
+            --disable-indexing \
+            --transform-for-static-hosting \
+            --hosting-base-path swift-logger-elastic/${{ matrix.product }} \
+            --output-path "$DOCS_OUTPUT/${{ matrix.product }}" \
             --warnings-as-errors

@@ -51,4 +51,50 @@ enum NDJSONBulkBody {
         }
         return body
     }
+
+    /// Builds the NDJSON body for a batch of ECS-encoded documents
+    /// targeting `indexName`. Each document is preceded by its own
+    /// `{"create":{"_index":"<indexName>"}}` action line and
+    /// followed by a single terminating newline. The whole-body
+    /// framing is `<action_1>\n<doc_1>\n<action_2>\n<doc_2>\n…`.
+    ///
+    /// The action line is built through `JSONSerialization` rather
+    /// than string interpolation so an `indexName` containing
+    /// quote, backslash, newline, or non-ASCII bytes can never
+    /// break NDJSON framing. The hot path encodes the action once
+    /// per `make` call and appends the encoded bytes verbatim for
+    /// every document.
+    ///
+    /// Same trailing-newline contract per document as
+    /// ``make(document:)``: documents that already end with `0x0A`
+    /// keep their existing newline, never doubled.
+    ///
+    /// Reserved capacity is computed exactly so the body's
+    /// underlying storage is allocated once.
+    ///
+    /// Throws whatever `JSONSerialization.data(withJSONObject:)`
+    /// raises — caller (the Elastic adapter) routes the throw
+    /// through `RemoteTransport.classify(_:)` as a whole-batch
+    /// failure.
+    static func make(documents: [Data], indexName: String) throws -> Data {
+        let actionDictionary: [String: Any] = [
+            ElasticBulkAction.create.rawValue: ["_index": indexName]
+        ]
+        let actionLineBytes = try JSONSerialization.data(withJSONObject: actionDictionary)
+        let totalCapacity = documents.reduce(0) { running, document in
+            let documentTrailingNewline = document.last == 0x0A ? 0 : 1
+            return running + actionLineBytes.count + 1 + document.count + documentTrailingNewline
+        }
+        var body = Data()
+        body.reserveCapacity(totalCapacity)
+        for document in documents {
+            body.append(actionLineBytes)
+            body.append(0x0A)
+            body.append(document)
+            if document.last != 0x0A {
+                body.append(0x0A)
+            }
+        }
+        return body
+    }
 }
